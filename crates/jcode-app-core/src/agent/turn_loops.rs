@@ -29,6 +29,7 @@ impl Agent {
     }
 
     pub(super) async fn run_turn(&mut self, print_output: bool) -> Result<String> {
+        self.reject_session_context_blocker()?;
         self.set_log_context();
         crate::session_metrics::record_turn(&self.session.id);
         // Mark this session as actively streaming for presence UIs (e.g. the

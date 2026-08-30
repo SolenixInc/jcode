@@ -104,6 +104,7 @@ pub fn hook_commands(event: &str) -> Vec<String> {
         "turn_start" => hooks.turn_start.as_ref(),
         "turn_end" => hooks.turn_end.as_ref(),
         "session_start" => hooks.session_start.as_ref(),
+        "session_context" => hooks.session_context.as_ref(),
         "session_end" => hooks.session_end.as_ref(),
         "pre_tool" => hooks.pre_tool.as_ref(),
         "post_tool" => hooks.post_tool.as_ref(),
@@ -115,6 +116,101 @@ pub fn hook_commands(event: &str) -> Vec<String> {
         .filter(|command| !command.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+const SESSION_CONTEXT_LIMIT: usize = 64 * 1024;
+
+/// Run the fail-closed session context channel synchronously.
+pub fn run_session_context(event: HookEvent) -> anyhow::Result<String> {
+    let commands = hook_commands("session_context");
+    if commands.is_empty() {
+        return Ok(String::new());
+    }
+    let timeout = std::time::Duration::from_millis(
+        crate::config::config()
+            .hooks
+            .session_context_timeout_ms
+            .max(1),
+    );
+    let mut contexts = Vec::new();
+    for command_line in commands {
+        let mut cmd = build_hook_process(&command_line, &event)
+            .map_err(|e| anyhow::anyhow!("session_context hook is invalid: {e}"))?;
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("session_context hook failed to start: {e}"))?;
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let out_thread = std::thread::spawn(move || {
+            let mut v = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::BufReader::new(stdout), &mut v).ok();
+            v
+        });
+        let err_thread = std::thread::spawn(move || {
+            let mut v = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::BufReader::new(stderr), &mut v).ok();
+            v
+        });
+        let started = std::time::Instant::now();
+        let status = loop {
+            if let Some(s) = child
+                .try_wait()
+                .map_err(|e| anyhow::anyhow!("session_context hook wait failed: {e}"))?
+            {
+                break s;
+            }
+            if started.elapsed() >= timeout {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow::anyhow!(
+                    "session_context hook timed out after {}ms",
+                    timeout.as_millis()
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        let output = out_thread.join().unwrap_or_default();
+        let stderr = err_thread.join().unwrap_or_default();
+        if !status.success() {
+            return Err(anyhow::anyhow!(
+                "session_context hook exited unsuccessfully (status={status}, stderr={})",
+                truncate_bytes(&String::from_utf8_lossy(&stderr), BLOCK_REASON_LIMIT)
+            ));
+        }
+        let text = String::from_utf8(output)
+            .map_err(|_| anyhow::anyhow!("session_context hook returned non-UTF-8 output"))?;
+        let value = serde_json::from_str::<serde_json::Value>(&text).ok();
+        let context = value
+            .as_ref()
+            .and_then(|v| {
+                v.get("hookSpecificOutput")
+                    .and_then(|v| v.get("additionalContext"))
+                    .or_else(|| v.get("additionalContext"))
+            })
+            .and_then(|v| v.as_str())
+            .unwrap_or(&text)
+            .trim();
+        if context.len() > SESSION_CONTEXT_LIMIT {
+            return Err(anyhow::anyhow!(
+                "session_context hook output exceeded {} bytes",
+                SESSION_CONTEXT_LIMIT
+            ));
+        }
+        if !context.is_empty() {
+            contexts.push(context.to_string());
+        }
+    }
+    let joined = contexts.join("\n");
+    if joined.len() > SESSION_CONTEXT_LIMIT {
+        return Err(anyhow::anyhow!(
+            "combined session_context output exceeded {} bytes",
+            SESSION_CONTEXT_LIMIT
+        ));
+    }
+    Ok(joined)
 }
 
 /// The first configured command for `event`, retained for scalar callers.
@@ -379,6 +475,16 @@ async fn run_pre_tool_command(
 #[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_start_context_plain_text_contract_is_supported() {
+        let event = HookEvent::new("session_context")
+            .session_id("ses_context")
+            .field("SOURCE", "create")
+            .field("MODEL", "test-model");
+        assert_eq!(event.event, "session_context");
+        assert_eq!(event.session_id.as_deref(), Some("ses_context"));
+    }
 
     #[test]
     fn payload_json_includes_event_and_lowercased_fields() {

@@ -716,6 +716,7 @@ impl Agent {
         let env_snapshot_start = Instant::now();
         self.log_env_snapshot("resume");
         let env_snapshot_ms = env_snapshot_start.elapsed().as_millis();
+        self.run_session_context_hook("resume");
         self.fire_session_lifecycle_hook("session_start", "resume");
 
         let save_start = Instant::now();

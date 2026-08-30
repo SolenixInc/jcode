@@ -582,6 +582,8 @@ swarm_max_concurrent_agents = 32
 # Runs when a session becomes active. Extra: JCODE_HOOK_SOURCE
 # ("create"/"attach"/"resume").
 # session_start = ""
+# session_context = ""
+# session_context_timeout_ms = 30000
 #
 # Runs when a session closes normally. Extra: JCODE_HOOK_SOURCE ("close").
 # session_end = ""

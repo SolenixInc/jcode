@@ -8,6 +8,14 @@ use async_trait::async_trait;
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+#[test]
+fn session_start_context_system_reminder_is_provider_visible() {
+    let message = Message::user("<system-reminder>\ncontext\n</system-reminder>");
+    assert!(
+        matches!(&message.content[0], crate::message::ContentBlock::Text { text, .. } if text.contains("<system-reminder>"))
+    );
+}
+
 struct DelayedProvider {
     open_delay: Duration,
     first_event_delay: Duration,

@@ -481,6 +481,15 @@ impl Config {
         hook_env_override(&mut self.hooks.turn_start, "JCODE_HOOK_TURN_START");
         hook_env_override(&mut self.hooks.turn_end, "JCODE_HOOK_TURN_END");
         hook_env_override(&mut self.hooks.session_start, "JCODE_HOOK_SESSION_START");
+        hook_env_override(
+            &mut self.hooks.session_context,
+            "JCODE_HOOK_SESSION_CONTEXT",
+        );
+        if let Ok(value) = std::env::var("JCODE_HOOK_SESSION_CONTEXT_TIMEOUT_MS") {
+            if let Ok(parsed) = value.parse() {
+                self.hooks.session_context_timeout_ms = parsed;
+            }
+        }
         hook_env_override(&mut self.hooks.session_end, "JCODE_HOOK_SESSION_END");
         hook_env_override(&mut self.hooks.pre_tool, "JCODE_HOOK_PRE_TOOL");
         hook_env_override(&mut self.hooks.post_tool, "JCODE_HOOK_POST_TOOL");
