@@ -119,6 +119,7 @@ pub fn hook_commands(event: &str) -> Vec<String> {
 }
 
 const SESSION_CONTEXT_LIMIT: usize = 64 * 1024;
+const SESSION_CONTEXT_TEARDOWN_GRACE_MS: u64 = 250;
 
 struct BoundedHookOutput {
     bytes: Vec<u8>,
@@ -160,10 +161,47 @@ fn terminate_session_context_process_group(pid: u32) {
     let _ = crate::platform::signal_detached_process_group(pid, signal);
 }
 
-fn terminate_session_context_child(child: &mut std::process::Child) {
+fn terminate_session_context_child(mut child: std::process::Child) {
     terminate_session_context_process_group(child.id());
     let _ = child.kill();
-    let _ = child.wait();
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_millis(SESSION_CONTEXT_TEARDOWN_GRACE_MS);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Ok(None) | Err(_) => {
+                // The hook has already been killed. Reap it off the synchronous
+                // lifecycle path rather than allowing an unusual platform race
+                // to block the caller indefinitely.
+                crate::platform::reap_detached(child);
+                return;
+            }
+        }
+    }
+}
+
+fn join_session_context_reader(
+    handle: std::thread::JoinHandle<std::io::Result<BoundedHookOutput>>,
+    stream: &str,
+) -> anyhow::Result<Option<std::io::Result<BoundedHookOutput>>> {
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_millis(SESSION_CONTEXT_TEARDOWN_GRACE_MS);
+    while !handle.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    if !handle.is_finished() {
+        // A descendant can retain an inherited pipe even after the hook leader
+        // has exited. Dropping the handle detaches that reader so malformed or
+        // hostile hooks cannot hang the session lifecycle forever.
+        drop(handle);
+        return Ok(None);
+    }
+    handle.join().map(Some).map_err(|_| {
+        anyhow::anyhow!("session_context hook {stream} reader terminated unexpectedly")
+    })
 }
 
 fn parse_session_context_output(output: Vec<u8>) -> anyhow::Result<String> {
@@ -264,7 +302,7 @@ pub fn run_session_context(event: HookEvent) -> anyhow::Result<String> {
             std::thread::sleep(std::time::Duration::from_millis(5));
         };
         if !matches!(outcome, WaitOutcome::Exited(_)) {
-            terminate_session_context_child(&mut child);
+            terminate_session_context_child(child);
         } else if !out_thread.is_finished() || !err_thread.is_finished() {
             let pipe_grace = std::time::Instant::now();
             while pipe_grace.elapsed() < std::time::Duration::from_millis(50)
@@ -279,12 +317,8 @@ pub fn run_session_context(event: HookEvent) -> anyhow::Result<String> {
                 terminate_session_context_process_group(child.id());
             }
         }
-        let output = out_thread.join().map_err(|_| {
-            anyhow::anyhow!("session_context hook stdout reader terminated unexpectedly")
-        })?;
-        let stderr = err_thread.join().map_err(|_| {
-            anyhow::anyhow!("session_context hook stderr reader terminated unexpectedly")
-        })?;
+        let output = join_session_context_reader(out_thread, "stdout")?;
+        let stderr = join_session_context_reader(err_thread, "stderr")?;
         match outcome {
             WaitOutcome::StdoutExceeded => {
                 return Err(anyhow::anyhow!(
@@ -308,6 +342,18 @@ pub fn run_session_context(event: HookEvent) -> anyhow::Result<String> {
                 return Err(anyhow::anyhow!("session_context hook wait failed: {error}"));
             }
             WaitOutcome::Exited(status) => {
+                let output = output.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "session_context hook stdout reader cleanup timed out after {}ms",
+                        SESSION_CONTEXT_TEARDOWN_GRACE_MS
+                    )
+                })?;
+                let stderr = stderr.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "session_context hook stderr reader cleanup timed out after {}ms",
+                        SESSION_CONTEXT_TEARDOWN_GRACE_MS
+                    )
+                })?;
                 if output.as_ref().is_ok_and(|output| output.exceeded) {
                     return Err(anyhow::anyhow!(
                         "session_context hook output exceeded {} bytes",
@@ -652,6 +698,37 @@ mod tests {
         assert!(truncated.len() <= 3);
         assert!(text.starts_with(truncated));
         assert_eq!(truncate_bytes("short", 100), "short");
+    }
+
+    #[test]
+    fn session_context_reader_join_is_bounded() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            release_rx.recv().expect("release the retained reader");
+            finished_tx.send(()).expect("signal reader completion");
+            Ok(BoundedHookOutput {
+                bytes: Vec::new(),
+                exceeded: false,
+            })
+        });
+
+        let started = std::time::Instant::now();
+        let result = join_session_context_reader(reader, "stdout")
+            .expect("reader cleanup should not fail when the thread is retained");
+
+        assert!(
+            result.is_none(),
+            "a retained reader must be detached after the grace period"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "reader cleanup must be bounded"
+        );
+        release_tx.send(()).expect("release the detached reader");
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("detached reader should exit after release");
     }
 
     #[cfg(unix)]
