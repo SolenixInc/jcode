@@ -101,9 +101,38 @@ fn is_mutating_classifies() {
     assert!(super::is_mutating("click"));
     assert!(super::is_mutating("quit_app"));
     assert!(super::is_mutating("set_value"));
+    assert!(super::is_mutating("setup"));
     assert!(!super::is_mutating("screenshot"));
     assert!(!super::is_mutating("ui"));
     assert!(!super::is_mutating("discover"));
+}
+
+#[test]
+fn permission_report_formats_granted_state_without_setup_guidance() {
+    let report = super::setup::format_permission_report(true, true, true);
+    assert_eq!(
+        report,
+        "Accessibility (input + AX control): granted\n\
+Screen Recording (screenshots/OCR): granted\n\
+Swift toolchain (for OCR):          present"
+    );
+}
+
+#[test]
+fn permission_report_formats_missing_state_with_setup_guidance() {
+    let report = super::setup::format_permission_report(false, true, false);
+    assert!(report.contains("Accessibility (input + AX control): NOT granted"));
+    assert!(report.contains("Swift toolchain (for OCR):          missing"));
+    assert!(report.contains("Run action='setup'"));
+}
+
+#[tokio::test]
+async fn dry_run_blocks_setup_without_prompting() {
+    let out = run_action(json!({ "action": "setup", "dry_run": true }))
+        .await
+        .unwrap();
+    assert!(out.output.contains("dry_run"));
+    assert!(out.output.contains("setup"));
 }
 
 #[test]
