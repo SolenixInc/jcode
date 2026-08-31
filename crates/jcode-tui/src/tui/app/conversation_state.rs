@@ -846,6 +846,9 @@ impl App {
         );
 
         for msg in old_messages {
+            if Self::is_session_context_message(&msg) {
+                continue;
+            }
             let role = msg.role.clone();
             let kept_blocks: Vec<ContentBlock> = msg
                 .content

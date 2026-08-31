@@ -415,14 +415,16 @@ impl App {
         }
     }
 
-    fn is_session_context_message(message: &StoredMessage) -> bool {
-        message.content.iter().any(|block| {
-            matches!(
-                block,
-                ContentBlock::Text { text, .. }
-                    if text.contains(SESSION_CONTEXT_REMINDER_MARKER)
-            )
-        })
+    pub(super) fn is_session_context_message(message: &StoredMessage) -> bool {
+        message.role == Role::User
+            && message.display_role == Some(crate::session::StoredDisplayRole::System)
+            && message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Text { text, .. }
+                        if text.contains(SESSION_CONTEXT_REMINDER_MARKER)
+                )
+            })
     }
 
     pub(super) fn reject_session_context_blocker(&self) -> Result<()> {

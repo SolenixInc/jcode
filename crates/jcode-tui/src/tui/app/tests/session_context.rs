@@ -206,6 +206,91 @@ fn local_tui_repeated_restore_replaces_session_context_without_duplicates() {
 
 #[cfg(unix)]
 #[test]
+fn local_tui_context_refresh_preserves_user_prompt_containing_marker() {
+    with_temp_jcode_home(|| {
+        let hook_dir = tempfile::TempDir::new().expect("hook temp dir");
+        let hook = write_session_context_test_script(
+            hook_dir.path(),
+            "preserve-user-marker.sh",
+            "#!/bin/sh\nprintf 'fresh local tui context'\n",
+        );
+        let _hook_env = SessionContextTestEnv::new(&hook);
+        let mut app = create_test_app();
+        let user_prompt = "Please explain <!-- jcode:session_context --> without deleting this prompt";
+        app.session.add_message(Role::User, vec![ContentBlock::Text {
+            text: user_prompt.to_string(),
+            cache_control: None,
+        }]);
+
+        app.run_session_context_hook("resume");
+
+        assert!(app.session.messages.iter().any(|message| {
+            message.role == Role::User
+                && message.display_role.is_none()
+                && message.content.iter().any(|block| {
+                    matches!(block, ContentBlock::Text { text, .. } if text == user_prompt)
+                })
+        }));
+        assert_eq!(
+            app.session
+                .messages
+                .iter()
+                .filter(|message| {
+                    message.role == Role::User
+                        && message.display_role
+                            == Some(crate::session::StoredDisplayRole::System)
+                        && message.content.iter().any(|block| {
+                            matches!(
+                                block,
+                                ContentBlock::Text { text, .. }
+                                    if text.contains("<!-- jcode:session_context -->")
+                            )
+                        })
+                })
+                .count(),
+            1,
+            "refresh must replace only the generated context message"
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn remote_tui_constructor_leaves_session_context_hook_to_server() {
+    with_temp_jcode_home(|| {
+        let hook_dir = tempfile::TempDir::new().expect("hook temp dir");
+        let invocations = hook_dir.path().join("invocations");
+        let hook = write_session_context_test_script(
+            hook_dir.path(),
+            "remote-client.sh",
+            &format!(
+                "#!/bin/sh\nprintf '%s\n' \"$JCODE_HOOK_SOURCE\" >> '{}'\nprintf 'remote client must not inject this'\n",
+                invocations.display()
+            ),
+        );
+        let _hook_env = SessionContextTestEnv::new(&hook);
+
+        let app = App::new_for_remote_with_options(None, false);
+
+        assert!(app.is_remote);
+        assert!(
+            !invocations.exists(),
+            "remote client construction must not run the server-authoritative hook"
+        );
+        assert!(app.session.messages.iter().all(|message| {
+            message.content.iter().all(|block| {
+                !matches!(
+                    block,
+                    ContentBlock::Text { text, .. }
+                        if text.contains("remote client must not inject this")
+                )
+            })
+        }));
+    });
+}
+
+#[cfg(unix)]
+#[test]
 fn local_tui_concurrent_session_context_injections_stay_session_scoped() {
     with_temp_jcode_home(|| {
         let hook_dir = tempfile::TempDir::new().expect("hook temp dir");
