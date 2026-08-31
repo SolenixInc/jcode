@@ -881,6 +881,7 @@ impl App {
             });
             let _ = self.session.add_message(role, kept_blocks);
         }
+        self.run_session_context_hook("create");
         let _ = self.session.save();
 
         self.push_display_message(DisplayMessage::system(format!(

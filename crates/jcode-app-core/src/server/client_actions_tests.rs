@@ -2,7 +2,7 @@
 
 use super::{
     NotifySessionContext, clone_split_session, handle_notify_session, handle_rename_session,
-    handle_resume_all_sessions, handle_set_feature,
+    handle_resume_all_sessions, handle_set_feature, handle_transfer,
 };
 use crate::agent::Agent;
 use crate::message::{ContentBlock, Message, Role, StreamEvent, ToolDefinition};
@@ -37,6 +37,60 @@ fn empty_swarm_status_state() -> (
 }
 
 struct MockProvider;
+
+#[cfg(unix)]
+struct BlockedTransferEnv {
+    previous_home: Option<std::ffi::OsString>,
+    previous_hook: Option<std::ffi::OsString>,
+    previous_timeout: Option<std::ffi::OsString>,
+    _home: tempfile::TempDir,
+}
+
+#[cfg(unix)]
+impl BlockedTransferEnv {
+    fn new() -> Self {
+        let home = tempfile::TempDir::new().expect("temp JCODE_HOME");
+        let guard = Self {
+            previous_home: std::env::var_os("JCODE_HOME"),
+            previous_hook: std::env::var_os("JCODE_HOOK_SESSION_CONTEXT"),
+            previous_timeout: std::env::var_os("JCODE_HOOK_SESSION_CONTEXT_TIMEOUT_MS"),
+            _home: home,
+        };
+        crate::env::set_var("JCODE_HOME", guard._home.path());
+        crate::env::set_var(
+            "JCODE_HOOK_SESSION_CONTEXT",
+            "/nonexistent/jcode-session-context-hook",
+        );
+        crate::env::set_var("JCODE_HOOK_SESSION_CONTEXT_TIMEOUT_MS", "5000");
+        crate::config::invalidate_config_cache();
+        guard
+    }
+}
+
+#[cfg(unix)]
+impl Drop for BlockedTransferEnv {
+    fn drop(&mut self) {
+        for (key, previous) in [
+            ("JCODE_HOME", self.previous_home.take()),
+            ("JCODE_HOOK_SESSION_CONTEXT", self.previous_hook.take()),
+            (
+                "JCODE_HOOK_SESSION_CONTEXT_TIMEOUT_MS",
+                self.previous_timeout.take(),
+            ),
+        ] {
+            match previous {
+                Some(value) => crate::env::set_var(key, value),
+                None => crate::env::remove_var(key),
+            }
+        }
+        crate::config::invalidate_config_cache();
+    }
+}
+
+#[derive(Clone)]
+struct CountingTransferProvider {
+    simple_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
 
 #[derive(Clone, Default)]
 struct StreamingMockProvider {
@@ -73,6 +127,33 @@ impl Provider for MockProvider {
 }
 
 #[async_trait]
+impl Provider for CountingTransferProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        Err(anyhow::anyhow!("transfer should use complete_simple"))
+    }
+
+    async fn complete_simple(&self, _prompt: &str, _system: &str) -> Result<String> {
+        self.simple_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok("transfer summary".to_string())
+    }
+
+    fn name(&self) -> &str {
+        "counting-transfer"
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+}
+
+#[async_trait]
 impl Provider for StreamingMockProvider {
     async fn complete(
         &self,
@@ -102,6 +183,45 @@ impl Provider for StreamingMockProvider {
     fn fork(&self) -> Arc<dyn Provider> {
         Arc::new(self.clone())
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn transfer_rejects_blocked_session_before_provider_request() {
+    let _guard = crate::storage::lock_test_env();
+    let _env = BlockedTransferEnv::new();
+    let simple_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let provider: Arc<dyn Provider> = Arc::new(CountingTransferProvider {
+        simple_calls: simple_calls.clone(),
+    });
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+    agent.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "message requiring transfer compaction".to_string(),
+            cache_control: None,
+        }],
+    );
+    agent.mark_closed();
+    let session_id = agent.session_id().to_string();
+    let agent = Arc::new(Mutex::new(agent));
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+    handle_transfer(44, &session_id, &agent, &event_tx).await;
+
+    let event = event_rx.recv().await.expect("transfer response");
+    match event {
+        ServerEvent::Error { message, .. } => {
+            assert!(message.contains("Session context hook blocked startup"));
+        }
+        other => panic!("blocked transfer must fail before provider work, got {other:?}"),
+    }
+    assert_eq!(
+        simple_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "transfer compaction must not reach the provider while bootstrap is blocked"
+    );
 }
 
 #[test]

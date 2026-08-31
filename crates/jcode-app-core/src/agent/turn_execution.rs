@@ -4,6 +4,7 @@ use crate::{terminal_eprintln as eprintln, terminal_println as println};
 impl Agent {
     /// Run a single turn with the given user message
     pub async fn run_once(&mut self, user_message: &str) -> Result<()> {
+        self.reject_session_context_blocker()?;
         self.add_message(
             Role::User,
             vec![ContentBlock::Text {
@@ -29,6 +30,7 @@ impl Agent {
         user_message: &str,
         display_role: Option<crate::session::StoredDisplayRole>,
     ) -> Result<String> {
+        self.reject_session_context_blocker()?;
         self.add_message_with_display_role(
             Role::User,
             vec![ContentBlock::Text {
@@ -70,6 +72,7 @@ impl Agent {
         event_tx: mpsc::UnboundedSender<ServerEvent>,
         display_role: Option<crate::session::StoredDisplayRole>,
     ) -> Result<()> {
+        self.reject_session_context_blocker()?;
         // Inject any pending notifications before the user message
         let alerts = self.take_alerts();
         if !alerts.is_empty() {
@@ -214,7 +217,10 @@ impl Agent {
         self.reconcile_explicit_provider_pin_route();
         self.reset_runtime_state_for_session_change();
         self.provider_session_id = None;
+        self.log_env_snapshot("create");
+        self.run_session_context_hook("create");
         self.seed_compaction_from_session();
+        self.fire_session_lifecycle_hook("session_start", "create");
     }
 
     /// Clear provider session so the next turn sends full context.
@@ -704,6 +710,11 @@ impl Agent {
         let mark_active_ms = mark_active_start.elapsed().as_millis();
         self.sync_memory_dedup_state_from_session();
 
+        let env_snapshot_start = Instant::now();
+        self.log_env_snapshot("resume");
+        let env_snapshot_ms = env_snapshot_start.elapsed().as_millis();
+        self.run_session_context_hook("resume");
+
         logging::info(&format!(
             "restore_session: loaded session {} with {} messages, calling seed_compaction",
             session_id,
@@ -712,11 +723,6 @@ impl Agent {
         let compaction_start = Instant::now();
         self.seed_compaction_from_session();
         let compaction_ms = compaction_start.elapsed().as_millis();
-
-        let env_snapshot_start = Instant::now();
-        self.log_env_snapshot("resume");
-        let env_snapshot_ms = env_snapshot_start.elapsed().as_millis();
-        self.run_session_context_hook("resume");
         self.fire_session_lifecycle_hook("session_start", "resume");
 
         let save_start = Instant::now();

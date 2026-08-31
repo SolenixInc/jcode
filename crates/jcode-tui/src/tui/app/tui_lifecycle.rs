@@ -2,6 +2,8 @@ use super::state_ui::RestoredReloadInput;
 use super::*;
 use crate::tui::{backend, keybind};
 
+const SESSION_CONTEXT_REMINDER_MARKER: &str = "<!-- jcode:session_context -->";
+
 impl App {
     pub(super) fn apply_restored_reload_input(&mut self, restored: RestoredReloadInput) {
         self.input = restored.input;
@@ -346,6 +348,90 @@ impl App {
         self.consecutive_credential_failures = 0;
     }
 
+    pub(super) fn run_session_context_hook(&mut self, source: &str) {
+        self.session_context_blocker = None;
+        let previous_len = self.session.messages.len();
+        self.session
+            .messages
+            .retain(|message| !Self::is_session_context_message(message));
+        let removed_stale_context = self.session.messages.len() != previous_len;
+
+        if !crate::hooks::hook_configured("session_context") {
+            if removed_stale_context {
+                if let Err(error) = self.session.save_bootstrap_context() {
+                    self.session_context_blocker = Some(format!(
+                        "Session context hook blocked startup: failed to persist disabled bootstrap-context removal: {error}"
+                    ));
+                    crate::logging::error(self.session_context_blocker.as_deref().unwrap());
+                }
+            }
+            return;
+        }
+
+        let mut event = crate::hooks::HookEvent::new("session_context")
+            .session_id(self.session.id.clone())
+            .field("SOURCE", source)
+            .field("MODEL", self.provider.model());
+        if let Some(cwd) = self.session.working_dir.clone() {
+            event = event.cwd(cwd);
+        }
+
+        match crate::hooks::run_session_context(event) {
+            Ok(context) if !context.is_empty() => {
+                self.session.add_message_with_display_role(
+                    Role::User,
+                    vec![ContentBlock::Text {
+                        text: format!(
+                            "<system-reminder>\n{SESSION_CONTEXT_REMINDER_MARKER}\n{context}\n</system-reminder>"
+                        ),
+                        cache_control: None,
+                    }],
+                    Some(crate::session::StoredDisplayRole::System),
+                );
+                if let Err(error) = self.session.save_bootstrap_context() {
+                    self.session_context_blocker = Some(format!(
+                        "Session context hook blocked startup: failed to persist bootstrap context: {error}"
+                    ));
+                    crate::logging::error(self.session_context_blocker.as_deref().unwrap());
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let persistence_error = removed_stale_context
+                    .then(|| self.session.save_bootstrap_context().err())
+                    .flatten();
+                let detail = persistence_error.map_or_else(
+                    || error.to_string(),
+                    |persist_error| {
+                        format!(
+                            "{error}; failed to persist stale bootstrap-context removal: {persist_error}"
+                        )
+                    },
+                );
+                self.session_context_blocker =
+                    Some(format!("Session context hook blocked startup: {detail}"));
+                crate::logging::error(self.session_context_blocker.as_deref().unwrap());
+            }
+        }
+    }
+
+    fn is_session_context_message(message: &StoredMessage) -> bool {
+        message.content.iter().any(|block| {
+            matches!(
+                block,
+                ContentBlock::Text { text, .. }
+                    if text.contains(SESSION_CONTEXT_REMINDER_MARKER)
+            )
+        })
+    }
+
+    pub(super) fn reject_session_context_blocker(&self) -> Result<()> {
+        if let Some(error) = &self.session_context_blocker {
+            return Err(anyhow::anyhow!(error.clone()));
+        }
+        Ok(())
+    }
+
     pub(super) fn new_minimal_with_session(
         provider: Arc<dyn Provider>,
         registry: Registry,
@@ -467,6 +553,7 @@ impl App {
             pending_fallback_resend: None,
             pending_merge_offer: None,
             session_save_pending: false,
+            session_context_blocker: None,
             streaming_tool_calls: Vec::new(),
             attempt_committed_assistant_messages: 0,
             provider_session_id: None,
@@ -914,6 +1001,7 @@ impl App {
             pending_fallback_resend: None,
             pending_merge_offer: None,
             session_save_pending: false,
+            session_context_blocker: None,
             streaming_tool_calls: Vec::new(),
             attempt_committed_assistant_messages: 0,
             provider_session_id: None,
@@ -1206,6 +1294,7 @@ impl App {
             persisted_prompt_history: None,
         };
 
+        app.run_session_context_hook("create");
         for notice in app.provider.drain_startup_notices() {
             app.status_notice = Some((notice, Instant::now()));
         }

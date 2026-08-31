@@ -120,6 +120,90 @@ pub fn hook_commands(event: &str) -> Vec<String> {
 
 const SESSION_CONTEXT_LIMIT: usize = 64 * 1024;
 
+struct BoundedHookOutput {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+fn read_bounded_hook_output<R: std::io::Read>(
+    reader: R,
+    limit: usize,
+    exceeded_signal: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> std::io::Result<BoundedHookOutput> {
+    let mut reader = std::io::BufReader::new(reader);
+    let mut bytes = Vec::with_capacity(limit.min(8192));
+    let mut buffer = [0u8; 8192];
+    let mut exceeded = false;
+    loop {
+        let read = std::io::Read::read(&mut reader, &mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let keep = limit.saturating_sub(bytes.len()).min(read);
+        bytes.extend_from_slice(&buffer[..keep]);
+        if keep < read {
+            exceeded = true;
+            if let Some(signal) = &exceeded_signal {
+                signal.store(true, std::sync::atomic::Ordering::Release);
+            }
+            break;
+        }
+    }
+    Ok(BoundedHookOutput { bytes, exceeded })
+}
+
+fn terminate_session_context_process_group(pid: u32) {
+    #[cfg(unix)]
+    let signal = libc::SIGKILL;
+    #[cfg(windows)]
+    let signal = 0;
+    let _ = crate::platform::signal_detached_process_group(pid, signal);
+}
+
+fn terminate_session_context_child(child: &mut std::process::Child) {
+    terminate_session_context_process_group(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn parse_session_context_output(output: Vec<u8>) -> anyhow::Result<String> {
+    if output.len() > SESSION_CONTEXT_LIMIT {
+        return Err(anyhow::anyhow!(
+            "session_context hook output exceeded {} bytes",
+            SESSION_CONTEXT_LIMIT
+        ));
+    }
+    let text = String::from_utf8(output)
+        .map_err(|_| anyhow::anyhow!("session_context hook returned non-UTF-8 output"))?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow::anyhow!("session_context hook returned no context"));
+    }
+    let context = match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(value) => value
+            .get("hookSpecificOutput")
+            .and_then(|value| value.get("additionalContext"))
+            .or_else(|| value.get("additionalContext"))
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                anyhow::anyhow!("session_context JSON output requires a string additionalContext")
+            })?
+            .trim()
+            .to_string(),
+        Err(_) => trimmed.to_string(),
+    };
+    if context.is_empty() {
+        return Err(anyhow::anyhow!("session_context hook returned no context"));
+    }
+    if context.len() > SESSION_CONTEXT_LIMIT {
+        return Err(anyhow::anyhow!(
+            "session_context hook output exceeded {} bytes",
+            SESSION_CONTEXT_LIMIT
+        ));
+    }
+    Ok(context)
+}
+
 /// Run the fail-closed session context channel synchronously.
 pub fn run_session_context(event: HookEvent) -> anyhow::Result<String> {
     let commands = hook_commands("session_context");
@@ -133,74 +217,134 @@ pub fn run_session_context(event: HookEvent) -> anyhow::Result<String> {
             .max(1),
     );
     let mut contexts = Vec::new();
+    let mut combined_len = 0usize;
     for command_line in commands {
         let mut cmd = build_hook_process(&command_line, &event)
             .map_err(|e| anyhow::anyhow!("session_context hook is invalid: {e}"))?;
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        let mut child = cmd
-            .spawn()
+        let mut child = crate::platform::spawn_detached(&mut cmd)
             .map_err(|e| anyhow::anyhow!("session_context hook failed to start: {e}"))?;
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
+        let stdout_exceeded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stdout_exceeded_reader = stdout_exceeded.clone();
         let out_thread = std::thread::spawn(move || {
-            let mut v = Vec::new();
-            std::io::Read::read_to_end(&mut std::io::BufReader::new(stdout), &mut v).ok();
-            v
+            read_bounded_hook_output(stdout, SESSION_CONTEXT_LIMIT, Some(stdout_exceeded_reader))
         });
+        let stderr_exceeded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stderr_exceeded_reader = stderr_exceeded.clone();
         let err_thread = std::thread::spawn(move || {
-            let mut v = Vec::new();
-            std::io::Read::read_to_end(&mut std::io::BufReader::new(stderr), &mut v).ok();
-            v
+            read_bounded_hook_output(stderr, BLOCK_REASON_LIMIT, Some(stderr_exceeded_reader))
         });
         let started = std::time::Instant::now();
-        let status = loop {
-            if let Some(s) = child
-                .try_wait()
-                .map_err(|e| anyhow::anyhow!("session_context hook wait failed: {e}"))?
-            {
-                break s;
+        enum WaitOutcome {
+            Exited(std::process::ExitStatus),
+            StdoutExceeded,
+            StderrExceeded,
+            TimedOut,
+            WaitFailed(std::io::Error),
+        }
+        let outcome = loop {
+            if stdout_exceeded.load(std::sync::atomic::Ordering::Acquire) {
+                break WaitOutcome::StdoutExceeded;
+            }
+            if stderr_exceeded.load(std::sync::atomic::Ordering::Acquire) {
+                break WaitOutcome::StderrExceeded;
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break WaitOutcome::Exited(status),
+                Ok(None) => {}
+                Err(error) => break WaitOutcome::WaitFailed(error),
             }
             if started.elapsed() >= timeout {
-                let _ = child.kill();
-                let _ = child.wait();
+                break WaitOutcome::TimedOut;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        if !matches!(outcome, WaitOutcome::Exited(_)) {
+            terminate_session_context_child(&mut child);
+        } else if !out_thread.is_finished() || !err_thread.is_finished() {
+            let pipe_grace = std::time::Instant::now();
+            while pipe_grace.elapsed() < std::time::Duration::from_millis(50)
+                && (!out_thread.is_finished() || !err_thread.is_finished())
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            if !out_thread.is_finished() || !err_thread.is_finished() {
+                // A shell leader may exit while descendants still inherit its
+                // stdout/stderr pipes. Terminate the detached group before
+                // joining readers so a completed hook cannot hang startup.
+                terminate_session_context_process_group(child.id());
+            }
+        }
+        let output = out_thread.join().map_err(|_| {
+            anyhow::anyhow!("session_context hook stdout reader terminated unexpectedly")
+        })?;
+        let stderr = err_thread.join().map_err(|_| {
+            anyhow::anyhow!("session_context hook stderr reader terminated unexpectedly")
+        })?;
+        match outcome {
+            WaitOutcome::StdoutExceeded => {
+                return Err(anyhow::anyhow!(
+                    "session_context hook output exceeded {} bytes",
+                    SESSION_CONTEXT_LIMIT
+                ));
+            }
+            WaitOutcome::StderrExceeded => {
+                return Err(anyhow::anyhow!(
+                    "session_context hook stderr exceeded {} bytes",
+                    BLOCK_REASON_LIMIT
+                ));
+            }
+            WaitOutcome::TimedOut => {
                 return Err(anyhow::anyhow!(
                     "session_context hook timed out after {}ms",
                     timeout.as_millis()
                 ));
             }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        };
-        let output = out_thread.join().unwrap_or_default();
-        let stderr = err_thread.join().unwrap_or_default();
-        if !status.success() {
-            return Err(anyhow::anyhow!(
-                "session_context hook exited unsuccessfully (status={status}, stderr={})",
-                truncate_bytes(&String::from_utf8_lossy(&stderr), BLOCK_REASON_LIMIT)
-            ));
-        }
-        let text = String::from_utf8(output)
-            .map_err(|_| anyhow::anyhow!("session_context hook returned non-UTF-8 output"))?;
-        let value = serde_json::from_str::<serde_json::Value>(&text).ok();
-        let context = value
-            .as_ref()
-            .and_then(|v| {
-                v.get("hookSpecificOutput")
-                    .and_then(|v| v.get("additionalContext"))
-                    .or_else(|| v.get("additionalContext"))
-            })
-            .and_then(|v| v.as_str())
-            .unwrap_or(&text)
-            .trim();
-        if context.len() > SESSION_CONTEXT_LIMIT {
-            return Err(anyhow::anyhow!(
-                "session_context hook output exceeded {} bytes",
-                SESSION_CONTEXT_LIMIT
-            ));
-        }
-        if !context.is_empty() {
-            contexts.push(context.to_string());
+            WaitOutcome::WaitFailed(error) => {
+                return Err(anyhow::anyhow!("session_context hook wait failed: {error}"));
+            }
+            WaitOutcome::Exited(status) => {
+                if output.as_ref().is_ok_and(|output| output.exceeded) {
+                    return Err(anyhow::anyhow!(
+                        "session_context hook output exceeded {} bytes",
+                        SESSION_CONTEXT_LIMIT
+                    ));
+                }
+                if stderr.as_ref().is_ok_and(|stderr| stderr.exceeded) {
+                    return Err(anyhow::anyhow!(
+                        "session_context hook stderr exceeded {} bytes",
+                        BLOCK_REASON_LIMIT
+                    ));
+                }
+                let output = output.map_err(|error| {
+                    anyhow::anyhow!("session_context hook stdout read failed: {error}")
+                })?;
+                let stderr = stderr.map_err(|error| {
+                    anyhow::anyhow!("session_context hook stderr read failed: {error}")
+                })?;
+                if !status.success() {
+                    return Err(anyhow::anyhow!(
+                        "session_context hook exited unsuccessfully (status={status}, stderr={})",
+                        String::from_utf8_lossy(&stderr.bytes)
+                    ));
+                }
+                let context = parse_session_context_output(output.bytes)?;
+                let next_len = combined_len
+                    .saturating_add(usize::from(!contexts.is_empty()))
+                    .saturating_add(context.len());
+                if next_len > SESSION_CONTEXT_LIMIT {
+                    return Err(anyhow::anyhow!(
+                        "combined session_context output exceeded {} bytes",
+                        SESSION_CONTEXT_LIMIT
+                    ));
+                }
+                combined_len = next_len;
+                contexts.push(context);
+            }
         }
     }
     let joined = contexts.join("\n");
@@ -477,7 +621,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_start_context_plain_text_contract_is_supported() {
+    fn session_context_event_fields_are_available_to_hooks() {
         let event = HookEvent::new("session_context")
             .session_id("ses_context")
             .field("SOURCE", "create")
@@ -546,6 +690,283 @@ mod tests {
         crate::env::set_var("JCODE_HOOK_PRE_TOOL", hook);
         crate::env::set_var("JCODE_HOOK_PRE_TOOL_TIMEOUT_MS", timeout_ms.to_string());
         reset
+    }
+
+    #[cfg(unix)]
+    fn session_context_test_config(hook: &str, timeout_ms: u64) -> impl Drop + use<> {
+        struct EnvReset(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for EnvReset {
+            fn drop(&mut self) {
+                for (key, previous) in self.0.drain(..) {
+                    match previous {
+                        Some(value) => crate::env::set_var(key, value),
+                        None => crate::env::remove_var(key),
+                    }
+                }
+                crate::config::invalidate_config_cache();
+            }
+        }
+        let reset = EnvReset(vec![
+            (
+                "JCODE_HOOK_SESSION_CONTEXT",
+                std::env::var_os("JCODE_HOOK_SESSION_CONTEXT"),
+            ),
+            (
+                "JCODE_HOOK_SESSION_CONTEXT_TIMEOUT_MS",
+                std::env::var_os("JCODE_HOOK_SESSION_CONTEXT_TIMEOUT_MS"),
+            ),
+        ]);
+        crate::env::set_var("JCODE_HOOK_SESSION_CONTEXT", hook);
+        crate::env::set_var(
+            "JCODE_HOOK_SESSION_CONTEXT_TIMEOUT_MS",
+            timeout_ms.to_string(),
+        );
+        crate::config::invalidate_config_cache();
+        reset
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_context_rejects_empty_configured_output() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let hook = write_executable_script(temp.path(), "empty.sh", "#!/bin/sh\nexit 0\n");
+        let _env = session_context_test_config(&hook.to_string_lossy(), 5000);
+
+        let error = run_session_context(
+            HookEvent::new("session_context")
+                .session_id("ses_empty")
+                .field("SOURCE", "create"),
+        )
+        .expect_err("configured empty output must fail closed");
+
+        assert!(error.to_string().contains("returned no context"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_context_rejects_json_without_a_string_context_field() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let hook = write_executable_script(
+            temp.path(),
+            "invalid-json-contract.sh",
+            "#!/bin/sh\nprintf '%s' '{\"hookSpecificOutput\":{\"additionalContext\":42}}'\n",
+        );
+        let _env = session_context_test_config(&hook.to_string_lossy(), 5000);
+
+        let error = run_session_context(
+            HookEvent::new("session_context")
+                .session_id("ses_invalid_json")
+                .field("SOURCE", "attach"),
+        )
+        .expect_err("JSON output without a string context must fail closed");
+
+        assert!(error.to_string().contains("string additionalContext"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_context_combines_plain_text_and_json_in_declaration_order() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let first = write_executable_script(
+            temp.path(),
+            "first.sh",
+            "#!/bin/sh\nprintf 'plain:%s:%s' \"$JCODE_HOOK_SOURCE\" \"$JCODE_HOOK_SESSION_ID\"\n",
+        );
+        let second = write_executable_script(
+            temp.path(),
+            "second.sh",
+            "#!/bin/sh\nprintf '%s' '{\"hookSpecificOutput\":{\"additionalContext\":\"json-second\"}}'\n",
+        );
+        let commands = serde_json::to_string(&vec![
+            first.to_string_lossy().into_owned(),
+            second.to_string_lossy().into_owned(),
+        ])
+        .expect("serialize hook command array");
+        let _env = session_context_test_config(&commands, 5000);
+
+        let context = run_session_context(
+            HookEvent::new("session_context")
+                .session_id("ses_ordered")
+                .field("SOURCE", "resume"),
+        )
+        .expect("ordered hooks should succeed");
+
+        assert_eq!(context, "plain:resume:ses_ordered\njson-second");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_context_stops_before_running_hooks_beyond_the_combined_limit() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let marker = temp.path().join("third-hook-ran");
+        let first = write_executable_script(
+            temp.path(),
+            "first-large.sh",
+            "#!/bin/sh\nhead -c 40000 /dev/zero | tr '\\000' a\n",
+        );
+        let second = write_executable_script(
+            temp.path(),
+            "second-large.sh",
+            "#!/bin/sh\nhead -c 30000 /dev/zero | tr '\\000' b\n",
+        );
+        let third = write_executable_script(
+            temp.path(),
+            "third-side-effect.sh",
+            &format!("#!/bin/sh\ntouch '{}'\nprintf third\n", marker.display()),
+        );
+        let commands = serde_json::to_string(&vec![
+            first.to_string_lossy().into_owned(),
+            second.to_string_lossy().into_owned(),
+            third.to_string_lossy().into_owned(),
+        ])
+        .expect("serialize hook command array");
+        let _env = session_context_test_config(&commands, 5000);
+
+        let error = run_session_context(HookEvent::new("session_context"))
+            .expect_err("combined output over the cap must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("combined session_context output exceeded")
+        );
+        assert!(
+            !marker.exists(),
+            "hooks after the cumulative output cap must not run"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_context_fails_closed_for_process_and_output_errors() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let event = || HookEvent::new("session_context").session_id("ses_fail_closed");
+
+        {
+            let _env = session_context_test_config("/nonexistent/session-context-hook", 5000);
+            let error = run_session_context(event()).expect_err("spawn failure must block");
+            assert!(error.to_string().contains("failed to start"));
+        }
+
+        let nonzero = write_executable_script(
+            temp.path(),
+            "nonzero.sh",
+            "#!/bin/sh\necho 'dossier bootstrap failed' >&2\nexit 7\n",
+        );
+        {
+            let _env = session_context_test_config(&nonzero.to_string_lossy(), 5000);
+            let error = run_session_context(event()).expect_err("nonzero exit must block");
+            assert!(error.to_string().contains("dossier bootstrap failed"));
+        }
+
+        let non_utf8 =
+            write_executable_script(temp.path(), "non-utf8.sh", "#!/bin/sh\nprintf '\\377'\n");
+        {
+            let _env = session_context_test_config(&non_utf8.to_string_lossy(), 5000);
+            let error = run_session_context(event()).expect_err("non-UTF-8 output must block");
+            assert!(error.to_string().contains("non-UTF-8"));
+        }
+
+        let oversized = write_executable_script(
+            temp.path(),
+            "oversized.sh",
+            "#!/bin/sh\nhead -c 65537 /dev/zero | tr '\\000' x\n",
+        );
+        {
+            let _env = session_context_test_config(&oversized.to_string_lossy(), 5000);
+            let error = run_session_context(event()).expect_err("oversized output must block");
+            assert!(error.to_string().contains("exceeded 65536 bytes"));
+        }
+
+        let timeout = write_executable_script(temp.path(), "timeout.sh", "#!/bin/sh\nsleep 30\n");
+        {
+            let _env = session_context_test_config(&timeout.to_string_lossy(), 50);
+            let started = std::time::Instant::now();
+            let error = run_session_context(event()).expect_err("timeout must block");
+            assert!(error.to_string().contains("timed out after 50ms"));
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_context_aborts_immediately_after_the_output_limit() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let hook = write_executable_script(
+            temp.path(),
+            "oversized-then-sleep.sh",
+            "#!/bin/sh\nhead -c 65537 /dev/zero | tr '\\000' x\nsleep 30\n",
+        );
+        let _env = session_context_test_config(&hook.to_string_lossy(), 5000);
+
+        let started = std::time::Instant::now();
+        let error = run_session_context(HookEvent::new("session_context"))
+            .expect_err("the output cap must terminate the hook immediately");
+
+        assert!(error.to_string().contains("exceeded 65536 bytes"));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "the output cap must not wait for the full hook timeout"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_context_aborts_immediately_after_the_stderr_limit() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let hook = write_executable_script(
+            temp.path(),
+            "oversized-stderr-then-sleep.sh",
+            &format!(
+                "#!/bin/sh\nhead -c {} /dev/zero | tr '\\000' e >&2\nsleep 30\n",
+                BLOCK_REASON_LIMIT + 1
+            ),
+        );
+        let _env = session_context_test_config(&hook.to_string_lossy(), 5000);
+
+        let started = std::time::Instant::now();
+        let error = run_session_context(HookEvent::new("session_context"))
+            .expect_err("the stderr cap must terminate the hook immediately");
+
+        let error_text = error.to_string();
+        assert!(
+            error_text.contains(&format!("stderr exceeded {BLOCK_REASON_LIMIT} bytes")),
+            "unexpected stderr cap error: {error_text}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "the stderr cap must not wait for the full hook timeout"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_context_reaps_descendants_that_keep_output_pipes_open() {
+        let _guard = crate::storage::lock_test_env();
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let hook = write_executable_script(
+            temp.path(),
+            "leader-exits-descendant-sleeps.sh",
+            "#!/bin/sh\nsleep 30 &\nprintf context-ready\n",
+        );
+        let _env = session_context_test_config(&hook.to_string_lossy(), 5000);
+
+        let started = std::time::Instant::now();
+        let context = run_session_context(HookEvent::new("session_context"))
+            .expect("a completed hook must not wait for a descendant that inherited its pipes");
+
+        assert_eq!(context, "context-ready");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "the completed hook must reap descendants before joining output readers"
+        );
     }
 
     #[cfg(unix)]

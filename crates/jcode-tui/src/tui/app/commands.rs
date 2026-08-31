@@ -399,6 +399,7 @@ async fn prepare_transfer_session_local(
 }
 
 pub(super) fn start_local_transfer_prepare(app: &mut App) -> anyhow::Result<()> {
+    app.reject_session_context_blocker()?;
     if app.pending_local_transfer.is_some() {
         return Ok(());
     }
@@ -3359,6 +3360,11 @@ pub(super) fn handle_config_command(app: &mut App, trimmed: &str) -> bool {
     }
 
     if trimmed == "/compact" {
+        if let Err(error) = app.reject_session_context_blocker() {
+            app.push_display_message(DisplayMessage::system(format!("⚠ Cannot compact: {error}")));
+            app.set_status_notice("Compaction blocked by session context");
+            return true;
+        }
         if !app.provider.supports_compaction() {
             app.push_display_message(DisplayMessage::system(
                 "Manual compaction is not available for this provider.".to_string(),

@@ -583,6 +583,45 @@ impl Session {
         }
         result
     }
+
+    /// Persist model-visible bootstrap context before the first visible turn.
+    ///
+    /// Hidden-only sessions deliberately stay out of the recent-session index so
+    /// opening an unused panel does not clutter History, but the bootstrap state
+    /// still needs a durable snapshot for attach/resume and crash recovery.
+    pub fn save_bootstrap_context(&mut self) -> Result<()> {
+        let hidden_only = !self
+            .messages
+            .iter()
+            .any(super::is_visible_conversation_message)
+            && !self.saved
+            && self.custom_title.is_none();
+        if !hidden_only {
+            return self.save();
+        }
+
+        self.updated_at = Utc::now();
+        let path = session_path(&self.id)?;
+        let journal_path = session_journal_path_from_snapshot(&path);
+        let result = self.checkpoint_snapshot(&path, &journal_path);
+        let mut fields = vec![
+            ("phase", "bootstrap_context_save_done".to_string()),
+            ("session_id", self.id.clone()),
+            ("path", path.display().to_string()),
+            ("messages", self.messages.len().to_string()),
+            (
+                "result",
+                if result.is_ok() { "ok" } else { "error" }.to_string(),
+            ),
+        ];
+        if let Err(error) = &result {
+            fields.push(("error", crate::util::format_error_chain(error)));
+            crate::logging::event_warn("SESSION_PERSISTENCE", fields);
+        } else {
+            crate::logging::event_info("SESSION_PERSISTENCE", fields);
+        }
+        result
+    }
 }
 
 #[cfg(test)]
