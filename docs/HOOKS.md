@@ -12,14 +12,17 @@ sessions appear*); lifecycle hooks tell you *what is happening inside them*.
 [hooks]
 turn_end      = "~/bin/jcode-turn-notify"     # observer
 session_start = ""                            # observer
+session_context = ""                           # synchronous, fail-closed context
 session_end   = ""                            # observer
 pre_tool      = "~/bin/jcode-tool-policy"     # gate
 post_tool     = ""                            # observer
 pre_tool_timeout_ms = 5000
+session_context_timeout_ms = 30000
 ```
 
 Env overrides (always win; empty value disables a config hook):
 `JCODE_HOOK_TURN_END`, `JCODE_HOOK_SESSION_START`, `JCODE_HOOK_SESSION_END`,
+`JCODE_HOOK_SESSION_CONTEXT`, `JCODE_HOOK_SESSION_CONTEXT_TIMEOUT_MS`,
 `JCODE_HOOK_PRE_TOOL`, `JCODE_HOOK_POST_TOOL`, `JCODE_HOOK_PRE_TOOL_TIMEOUT_MS`.
 
 ## Common contract
@@ -81,6 +84,18 @@ success), `JCODE_HOOK_ERROR` (on failure).
 Fail-open is deliberate: a broken policy script should degrade to "no policy"
 rather than brick every session. If you need fail-closed semantics, make the
 hook itself robust (it is your trust boundary, not jcode).
+
+## Synchronous context hook: `session_context`
+
+`session_context` runs synchronously whenever a session becomes active, before
+the detached `session_start` observer. It receives `JCODE_HOOK_SOURCE`
+(`create`, `attach`, or `resume`) and `JCODE_HOOK_MODEL`. Exit 0 is required.
+Plain-text stdout is accepted, as is JSON containing either
+`hookSpecificOutput.additionalContext` or top-level `additionalContext`.
+Successful outputs are concatenated in command order and persisted as one
+`<system-reminder>` message visible to the provider. Timeout, spawn failure,
+nonzero exit, invalid output, or output over 64 KiB blocks the session before
+any model request. The default timeout is 30 seconds.
 
 ### Example policy script
 

@@ -984,6 +984,9 @@ pub struct App {
     pending_merge_offer: Option<PendingMergeOffer>,
     // Local session file write to flush once the first "sending" frame is visible.
     session_save_pending: bool,
+    // Synchronous session_context failures block every local provider boundary until the
+    // session is reactivated successfully.
+    session_context_blocker: Option<String>,
     // Tool calls detected during streaming (shown in real-time with details)
     streaming_tool_calls: Vec<ToolCall>,
     // Assistant transcript messages committed during the current provider

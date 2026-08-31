@@ -846,6 +846,9 @@ impl App {
         );
 
         for msg in old_messages {
+            if Self::is_session_context_message(&msg) {
+                continue;
+            }
             let role = msg.role.clone();
             let kept_blocks: Vec<ContentBlock> = msg
                 .content
@@ -881,6 +884,7 @@ impl App {
             });
             let _ = self.session.add_message(role, kept_blocks);
         }
+        self.run_session_context_hook("create");
         let _ = self.session.save();
 
         self.push_display_message(DisplayMessage::system(format!(

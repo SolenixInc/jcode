@@ -53,6 +53,7 @@ pub use jcode_agent_runtime::{
 };
 
 const JCODE_NATIVE_TOOLS: &[&str] = &["selfdev", "communicate"];
+const SESSION_CONTEXT_REMINDER_MARKER: &str = "<!-- jcode:session_context -->";
 static RECOVERED_TEXT_WRAPPED_TOOL_CALLS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static JCODE_REPO_SOURCE_STATE: LazyLock<(Option<String>, Option<bool>)> = LazyLock::new(|| {
@@ -259,6 +260,7 @@ pub struct Agent {
     /// Prevent duplicate content uploads when shutdown/finalization is invoked
     /// more than once for the same in-memory agent.
     transcript_telemetry_sent: bool,
+    session_context_blocker: Option<String>,
 }
 
 impl Agent {
@@ -328,6 +330,7 @@ impl Agent {
             inline_output_tap: false,
             inline_tail: inline_tail::InlineTailBuffer::default(),
             transcript_telemetry_sent: false,
+            session_context_blocker: None,
         };
         crate::tool::set_session_tool_policy(
             &agent.session.id,
@@ -393,8 +396,9 @@ impl Agent {
         agent.session.provider_key = agent.provider_key_for_new_session();
         agent.reconcile_explicit_provider_pin_route();
         agent.session.ensure_initial_session_context_message();
-        agent.seed_compaction_from_session();
         agent.log_env_snapshot("create");
+        agent.run_session_context_hook("create");
+        agent.seed_compaction_from_session();
         agent.fire_session_lifecycle_hook("session_start", "create");
         crate::telemetry::begin_session_with_parent(
             agent.provider.name(),
@@ -454,8 +458,9 @@ impl Agent {
         agent.restore_reasoning_effort_from_session();
         agent.session.ensure_initial_session_context_message();
         agent.sync_memory_dedup_state_from_session();
-        agent.seed_compaction_from_session();
         agent.log_env_snapshot("attach");
+        agent.run_session_context_hook("attach");
+        agent.seed_compaction_from_session();
         agent.fire_session_lifecycle_hook("session_start", "attach");
         crate::telemetry::begin_session_with_parent(
             agent.provider.name(),
@@ -948,6 +953,85 @@ impl Agent {
             event = event.cwd(cwd);
         }
         crate::hooks::dispatch_observer(event);
+    }
+
+    pub(crate) fn run_session_context_hook(&mut self, source: &str) {
+        self.session_context_blocker = None;
+        let previous_len = self.session.messages.len();
+        self.session
+            .messages
+            .retain(|message| !Self::is_session_context_message(message));
+        let removed_stale_context = self.session.messages.len() != previous_len;
+        if !crate::hooks::hook_configured("session_context") {
+            if removed_stale_context {
+                if let Err(error) = self.session.save_bootstrap_context() {
+                    self.session_context_blocker = Some(format!(
+                        "Session context hook blocked startup: failed to persist disabled bootstrap-context removal: {error}"
+                    ));
+                    logging::error(self.session_context_blocker.as_deref().unwrap());
+                }
+            }
+            return;
+        }
+        let mut event = crate::hooks::HookEvent::new("session_context")
+            .session_id(self.session.id.clone())
+            .field("SOURCE", source)
+            .field("MODEL", self.provider_model());
+        if let Some(cwd) = self.working_dir() {
+            event = event.cwd(cwd);
+        }
+        match crate::hooks::run_session_context(event) {
+            Ok(context) if !context.is_empty() => {
+                self.session.add_message_with_display_role(
+                    Role::User,
+                    vec![ContentBlock::Text {
+                        text: format!(
+                            "<system-reminder>\n{SESSION_CONTEXT_REMINDER_MARKER}\n{context}\n</system-reminder>"
+                        ),
+                        cache_control: None,
+                    }],
+                    Some(StoredDisplayRole::System),
+                );
+                if let Err(error) = self.session.save_bootstrap_context() {
+                    self.session_context_blocker = Some(format!(
+                        "Session context hook blocked startup: failed to persist bootstrap context: {error}"
+                    ));
+                    logging::error(self.session_context_blocker.as_deref().unwrap());
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let persistence_error = removed_stale_context
+                    .then(|| self.session.save_bootstrap_context().err())
+                    .flatten();
+                let detail = persistence_error.map_or_else(
+                    || error.to_string(),
+                    |persist_error| {
+                        format!(
+                            "{error}; failed to persist stale bootstrap-context removal: {persist_error}"
+                        )
+                    },
+                );
+                self.session_context_blocker =
+                    Some(format!("Session context hook blocked startup: {detail}"));
+                logging::error(self.session_context_blocker.as_deref().unwrap());
+            }
+        }
+    }
+
+    fn is_session_context_message(message: &StoredMessage) -> bool {
+        message.role == Role::User
+            && message.display_role == Some(StoredDisplayRole::System)
+            && message.content.iter().any(|block| {
+                matches!(block, ContentBlock::Text { text, .. } if text.contains(SESSION_CONTEXT_REMINDER_MARKER))
+            })
+    }
+
+    pub(crate) fn reject_session_context_blocker(&self) -> anyhow::Result<()> {
+        if let Some(error) = &self.session_context_blocker {
+            return Err(anyhow::anyhow!("{error}"));
+        }
+        Ok(())
     }
 
     pub fn mark_crashed(&mut self, message: Option<String>) {

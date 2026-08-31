@@ -363,6 +363,7 @@ impl App {
             self.update_context_limit_for_model(&active_model);
             // Mark session as active now that it's being used again
             self.session.mark_active();
+            self.run_session_context_hook("resume");
             self.set_side_panel_snapshot(
                 crate::side_panel::snapshot_for_session(session_id).unwrap_or_default(),
             );

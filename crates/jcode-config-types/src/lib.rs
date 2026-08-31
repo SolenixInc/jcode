@@ -862,6 +862,10 @@ pub struct HooksConfig {
     /// Fields: SOURCE ("create"/"resume").
     /// Env override: JCODE_HOOK_SESSION_START.
     pub session_start: Option<HookCommands>,
+    /// Synchronous context hook run before the session_start observer.
+    pub session_context: Option<HookCommands>,
+    /// Max milliseconds to wait for the session_context hook.
+    pub session_context_timeout_ms: u64,
     /// Runs when a session closes normally.
     /// Env override: JCODE_HOOK_SESSION_END.
     pub session_end: Option<HookCommands>,
@@ -885,6 +889,8 @@ impl Default for HooksConfig {
             turn_start: None,
             turn_end: None,
             session_start: None,
+            session_context: None,
+            session_context_timeout_ms: 30000,
             session_end: None,
             pre_tool: None,
             post_tool: None,

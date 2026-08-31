@@ -780,6 +780,28 @@ pub(super) async fn handle_transfer(
             ("session_id", client_session_id.to_string()),
         ],
     );
+    let provider = {
+        let agent_guard = agent.lock().await;
+        if let Err(error) = agent_guard.reject_session_context_blocker() {
+            crate::logging::event_warn(
+                "SESSION_LIFECYCLE",
+                vec![
+                    ("phase", "transfer_blocked_session_context".to_string()),
+                    ("request_id", id.to_string()),
+                    ("session_id", client_session_id.to_string()),
+                    ("error", crate::util::format_error_chain(&error)),
+                    ("elapsed_ms", started.elapsed().as_millis().to_string()),
+                ],
+            );
+            let _ = client_event_tx.send(ServerEvent::Error {
+                id,
+                message: format!("Transfer blocked: {error}"),
+                retry_after_secs: None,
+            });
+            return;
+        }
+        agent_guard.provider_fork()
+    };
     let parent = match Session::load(client_session_id) {
         Ok(session) => session,
         Err(error) => {
@@ -800,11 +822,6 @@ pub(super) async fn handle_transfer(
             });
             return;
         }
-    };
-
-    let provider = {
-        let agent_guard = agent.lock().await;
-        agent_guard.provider_fork()
     };
 
     let transfer_compaction = match crate::compaction::build_transfer_compaction_state(

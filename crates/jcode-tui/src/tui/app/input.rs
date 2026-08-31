@@ -3782,6 +3782,14 @@ impl App {
             }
         }
 
+        if let Err(error) = self.reject_session_context_blocker() {
+            self.input = raw_input;
+            self.cursor_pos = self.input.len();
+            self.push_display_message(DisplayMessage::error(format!("Error: {error}")));
+            self.set_status_notice("Session context blocked");
+            return;
+        }
+
         // Leaving the preview should happen as soon as the user acts on it.
         self.onboarding_preview_mode = false;
 

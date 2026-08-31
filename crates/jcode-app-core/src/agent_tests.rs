@@ -8,9 +8,482 @@ use async_trait::async_trait;
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+#[cfg(unix)]
+struct SessionContextEnvGuard {
+    previous_hook: Option<std::ffi::OsString>,
+    previous_timeout: Option<std::ffi::OsString>,
+}
+
+#[cfg(unix)]
+struct SessionContextHomeGuard {
+    previous_home: Option<std::ffi::OsString>,
+    _home: tempfile::TempDir,
+}
+
+#[cfg(unix)]
+struct SessionContextHomeOverrideGuard {
+    previous_home: Option<std::ffi::OsString>,
+}
+
+#[cfg(unix)]
+impl SessionContextHomeGuard {
+    fn new() -> Self {
+        let home = tempfile::TempDir::new().expect("temp JCODE_HOME");
+        let guard = Self {
+            previous_home: std::env::var_os("JCODE_HOME"),
+            _home: home,
+        };
+        crate::env::set_var("JCODE_HOME", guard._home.path());
+        crate::config::invalidate_config_cache();
+        guard
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SessionContextHomeGuard {
+    fn drop(&mut self) {
+        match self.previous_home.take() {
+            Some(value) => crate::env::set_var("JCODE_HOME", value),
+            None => crate::env::remove_var("JCODE_HOME"),
+        }
+        crate::config::invalidate_config_cache();
+    }
+}
+
+#[cfg(unix)]
+impl SessionContextHomeOverrideGuard {
+    fn new(path: &std::path::Path) -> Self {
+        let guard = Self {
+            previous_home: std::env::var_os("JCODE_HOME"),
+        };
+        crate::env::set_var("JCODE_HOME", path);
+        crate::config::invalidate_config_cache();
+        guard
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SessionContextHomeOverrideGuard {
+    fn drop(&mut self) {
+        match self.previous_home.take() {
+            Some(value) => crate::env::set_var("JCODE_HOME", value),
+            None => crate::env::remove_var("JCODE_HOME"),
+        }
+        crate::config::invalidate_config_cache();
+    }
+}
+
+#[cfg(unix)]
+impl SessionContextEnvGuard {
+    fn new(command: &str, timeout_ms: u64) -> Self {
+        let guard = Self {
+            previous_hook: std::env::var_os("JCODE_HOOK_SESSION_CONTEXT"),
+            previous_timeout: std::env::var_os("JCODE_HOOK_SESSION_CONTEXT_TIMEOUT_MS"),
+        };
+        guard.set_command(command);
+        crate::env::set_var(
+            "JCODE_HOOK_SESSION_CONTEXT_TIMEOUT_MS",
+            timeout_ms.to_string(),
+        );
+        crate::config::invalidate_config_cache();
+        guard
+    }
+
+    fn set_command(&self, command: &str) {
+        crate::env::set_var("JCODE_HOOK_SESSION_CONTEXT", command);
+        crate::config::invalidate_config_cache();
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SessionContextEnvGuard {
+    fn drop(&mut self) {
+        match self.previous_hook.take() {
+            Some(value) => crate::env::set_var("JCODE_HOOK_SESSION_CONTEXT", value),
+            None => crate::env::remove_var("JCODE_HOOK_SESSION_CONTEXT"),
+        }
+        match self.previous_timeout.take() {
+            Some(value) => crate::env::set_var("JCODE_HOOK_SESSION_CONTEXT_TIMEOUT_MS", value),
+            None => crate::env::remove_var("JCODE_HOOK_SESSION_CONTEXT_TIMEOUT_MS"),
+        }
+        crate::config::invalidate_config_cache();
+    }
+}
+
+#[cfg(unix)]
+fn write_session_context_script(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, body).expect("write session context script");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod session context script");
+    path
+}
+
+#[test]
+fn session_context_system_reminder_is_provider_visible() {
+    let message = Message::user("<system-reminder>\ncontext\n</system-reminder>");
+    assert!(
+        matches!(&message.content[0], crate::message::ContentBlock::Text { text, .. } if text.contains("<system-reminder>"))
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn session_context_clears_a_prior_blocker_after_recovery() {
+    let _lock = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let failing = write_session_context_script(
+        temp.path(),
+        "failing.sh",
+        "#!/bin/sh\necho 'bootstrap unavailable' >&2\nexit 9\n",
+    );
+    let recovered = write_session_context_script(
+        temp.path(),
+        "recovered.sh",
+        "#!/bin/sh\nprintf 'recovered context'\n",
+    );
+    let env = SessionContextEnvGuard::new(&failing.to_string_lossy(), 5000);
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+    assert!(agent.reject_session_context_blocker().is_err());
+
+    env.set_command(&recovered.to_string_lossy());
+    agent.run_session_context_hook("resume");
+
+    agent
+        .reject_session_context_blocker()
+        .expect("a successful retry must clear the previous blocker");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn session_context_persistence_failure_blocks_provider_turns() {
+    let _lock = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let invalid_home = temp.path().join("not-a-directory");
+    std::fs::write(&invalid_home, "file blocks JCODE_HOME directory creation")
+        .expect("write invalid JCODE_HOME file");
+    let _home = SessionContextHomeOverrideGuard::new(&invalid_home);
+    let hook = write_session_context_script(
+        temp.path(),
+        "context.sh",
+        "#!/bin/sh\nprintf 'durable context required'\n",
+    );
+    let _env = SessionContextEnvGuard::new(&hook.to_string_lossy(), 5000);
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    let blocker = agent
+        .reject_session_context_blocker()
+        .expect_err("failed bootstrap persistence must block provider turns");
+    assert!(
+        blocker
+            .to_string()
+            .contains("failed to persist bootstrap context")
+    );
+    let turn_error = agent
+        .run_once_capture("must remain blocked")
+        .await
+        .expect_err("provider turn must not begin after persistence failure");
+    assert!(
+        turn_error
+            .to_string()
+            .contains("failed to persist bootstrap context")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn session_context_failure_prevents_every_provider_turn() {
+    let _lock = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let failing = write_session_context_script(
+        temp.path(),
+        "failing.sh",
+        "#!/bin/sh\necho 'dossier bootstrap failed' >&2\nexit 17\n",
+    );
+    let _env = SessionContextEnvGuard::new(&failing.to_string_lossy(), 5000);
+    let complete_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let provider: Arc<dyn Provider> = Arc::new(CountingProvider {
+        complete_calls: complete_calls.clone(),
+    });
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+
+    let standard_error = agent
+        .run_once_capture("standard turn")
+        .await
+        .expect_err("a blocked session must reject the standard turn path");
+    assert!(
+        standard_error
+            .to_string()
+            .contains("Session context hook blocked startup")
+    );
+
+    let (event_tx, _event_rx) = tokio_mpsc::unbounded_channel();
+    let streaming_error = agent
+        .run_once_streaming_mpsc("streaming turn", Vec::new(), None, event_tx)
+        .await
+        .expect_err("a blocked session must reject the streaming turn path");
+    assert!(
+        streaming_error
+            .to_string()
+            .contains("Session context hook blocked startup")
+    );
+
+    agent.session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "context that would otherwise be compacted".to_string(),
+            cache_control: None,
+        }],
+    );
+    let (compaction_message, compaction_started) = agent.request_manual_compaction();
+    assert!(
+        !compaction_started,
+        "manual compaction must be rejected while bootstrap is blocked: {compaction_message}"
+    );
+    assert!(compaction_message.contains("Session context hook blocked startup"));
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    assert_eq!(
+        complete_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no provider request may begin while session context bootstrap is blocked"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn clear_runs_session_context_for_the_replacement_session() {
+    let _lock = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let hook = write_session_context_script(
+        temp.path(),
+        "source.sh",
+        "#!/bin/sh\nprintf 'context:%s' \"$JCODE_HOOK_SOURCE\"\n",
+    );
+    let _env = SessionContextEnvGuard::new(&hook.to_string_lossy(), 5000);
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+    let first_session_id = agent.session_id().to_string();
+
+    agent.clear();
+
+    assert_ne!(first_session_id, agent.session_id());
+    assert_eq!(
+        agent
+            .session
+            .messages
+            .iter()
+            .filter(|message| content_text(&message.content).contains("context:create"))
+            .count(),
+        1,
+        "the replacement session must receive fresh create context exactly once"
+    );
+    agent
+        .reject_session_context_blocker()
+        .expect("fresh replacement context must not leave startup blocked");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn session_context_replaces_stale_context_on_reactivation() {
+    let _lock = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let first = write_session_context_script(
+        temp.path(),
+        "first.sh",
+        "#!/bin/sh\nprintf 'first live context'\n",
+    );
+    let second = write_session_context_script(
+        temp.path(),
+        "second.sh",
+        "#!/bin/sh\nprintf 'second live context'\n",
+    );
+    let env = SessionContextEnvGuard::new(&first.to_string_lossy(), 5000);
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+    assert_eq!(
+        agent
+            .session
+            .messages
+            .iter()
+            .filter(|message| content_text(&message.content).contains("first live context"))
+            .count(),
+        1
+    );
+
+    env.set_command(&second.to_string_lossy());
+    agent.run_session_context_hook("resume");
+
+    assert_eq!(
+        agent
+            .session
+            .messages
+            .iter()
+            .filter(|message| content_text(&message.content).contains("first live context"))
+            .count(),
+        0,
+        "reactivation must remove stale session context"
+    );
+    assert_eq!(
+        agent
+            .session
+            .messages
+            .iter()
+            .filter(|message| content_text(&message.content).contains("second live context"))
+            .count(),
+        1,
+        "reactivation must persist exactly one current session context"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn session_context_is_fresh_and_unique_on_create_attach_and_resume() {
+    let _lock = crate::storage::lock_test_env();
+    let _home = SessionContextHomeGuard::new();
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let hook = write_session_context_script(
+        temp.path(),
+        "source.sh",
+        "#!/bin/sh\nprintf 'context:%s:%s' \"$JCODE_HOOK_SOURCE\" \"$JCODE_HOOK_SESSION_ID\"\n",
+    );
+    let _env = SessionContextEnvGuard::new(&hook.to_string_lossy(), 5000);
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let created = Agent::new(provider.clone(), registry);
+    let session_id = created.session_id().to_string();
+    let created_contexts: Vec<_> = created
+        .session
+        .messages
+        .iter()
+        .filter(|message| Agent::is_session_context_message(message))
+        .collect();
+    assert_eq!(created_contexts.len(), 1);
+    assert!(
+        content_text(&created_contexts[0].content)
+            .contains(&format!("context:create:{session_id}"))
+    );
+
+    let persisted_create = crate::session::Session::load(&session_id)
+        .expect("create context must be durable before the first visible turn");
+    assert!(
+        crate::recent_session_index::recent(10)
+            .expect("load recent-session index")
+            .iter()
+            .all(|entry| entry.session_id != session_id),
+        "hidden-only bootstrap persistence must not clutter recent History"
+    );
+
+    let registry = Registry::new(provider.clone()).await;
+    let attached = Agent::new_with_session(provider.clone(), registry, persisted_create, None);
+    let attached_contexts: Vec<_> = attached
+        .session
+        .messages
+        .iter()
+        .filter(|message| Agent::is_session_context_message(message))
+        .collect();
+    assert_eq!(attached_contexts.len(), 1);
+    assert!(
+        content_text(&attached_contexts[0].content)
+            .contains(&format!("context:attach:{session_id}"))
+    );
+
+    let persisted_attach = crate::session::Session::load(&session_id)
+        .expect("attach context must replace create context durably");
+    let persisted_attach_contexts: Vec<_> = persisted_attach
+        .messages
+        .iter()
+        .filter(|message| Agent::is_session_context_message(message))
+        .collect();
+    assert_eq!(persisted_attach_contexts.len(), 1);
+    assert!(
+        content_text(&persisted_attach_contexts[0].content)
+            .contains(&format!("context:attach:{session_id}"))
+    );
+
+    let registry = Registry::new(provider.clone()).await;
+    let mut resumed = Agent::new(provider, registry);
+    resumed
+        .restore_session(&session_id)
+        .expect("resume persisted session");
+    let resumed_contexts: Vec<_> = resumed
+        .session
+        .messages
+        .iter()
+        .filter(|message| Agent::is_session_context_message(message))
+        .collect();
+    assert_eq!(resumed_contexts.len(), 1);
+    assert!(
+        content_text(&resumed_contexts[0].content)
+            .contains(&format!("context:resume:{session_id}"))
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn disabling_session_context_removes_the_previous_injection() {
+    let _lock = crate::storage::lock_test_env();
+    let _home = SessionContextHomeGuard::new();
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let hook = write_session_context_script(
+        temp.path(),
+        "context.sh",
+        "#!/bin/sh\nprintf 'context that must not go stale'\n",
+    );
+    let env = SessionContextEnvGuard::new(&hook.to_string_lossy(), 5000);
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+    let session_id = agent.session_id().to_string();
+    assert!(
+        agent.session.messages.iter().any(
+            |message| content_text(&message.content).contains("context that must not go stale")
+        )
+    );
+
+    env.set_command("");
+    agent.run_session_context_hook("resume");
+
+    assert!(
+        !agent.session.messages.iter().any(
+            |message| content_text(&message.content).contains("context that must not go stale")
+        )
+    );
+    let persisted =
+        crate::session::Session::load(&session_id).expect("disabled hook cleanup must be durable");
+    assert!(
+        !persisted.messages.iter().any(
+            |message| content_text(&message.content).contains("context that must not go stale")
+        )
+    );
+    assert!(
+        crate::recent_session_index::recent(10)
+            .expect("load recent-session index")
+            .iter()
+            .all(|entry| entry.session_id != session_id),
+        "removing hidden bootstrap context must not clutter recent History"
+    );
+    agent
+        .reject_session_context_blocker()
+        .expect("disabling the hook must not block the session");
+}
+
 struct DelayedProvider {
     open_delay: Duration,
     first_event_delay: Duration,
+}
+
+#[derive(Clone)]
+struct CountingProvider {
+    complete_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 struct NativeAutoCompactionProvider;
@@ -126,6 +599,44 @@ impl Provider for DelayedProvider {
             open_delay: self.open_delay,
             first_event_delay: self.first_event_delay,
         })
+    }
+}
+
+#[async_trait]
+impl Provider for CountingProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        self.complete_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (_tx, rx) = tokio_mpsc::channel::<Result<StreamEvent>>(1);
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+
+    fn name(&self) -> &str {
+        "counting"
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+
+    fn supports_compaction(&self) -> bool {
+        true
+    }
+
+    fn context_window(&self) -> usize {
+        1_000
+    }
+
+    async fn complete_simple(&self, _prompt: &str, _system: &str) -> Result<String> {
+        self.complete_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok("counted compaction summary".to_string())
     }
 }
 

@@ -1322,7 +1322,9 @@ impl App {
             actions.push("Reset provider session resume state.".to_string());
         }
 
-        if !self.is_remote && self.provider.supports_compaction() {
+        if let Err(error) = self.reject_session_context_blocker() {
+            notes.push(format!("Compaction blocked by session context: {error}"));
+        } else if !self.is_remote && self.provider.supports_compaction() {
             let observed_tokens = self
                 .current_stream_context_tokens()
                 .or_else(|| context_error.then_some(self.context_limit));

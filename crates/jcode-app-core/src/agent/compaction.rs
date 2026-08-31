@@ -31,6 +31,9 @@ impl Agent {
     }
 
     pub fn request_manual_compaction(&mut self) -> (String, bool) {
+        if let Err(error) = self.reject_session_context_blocker() {
+            return (format!("⚠ **Cannot compact:** {error}"), false);
+        }
         if !self.provider.supports_compaction() {
             return (
                 "Manual compaction is not available for this provider.".to_string(),
