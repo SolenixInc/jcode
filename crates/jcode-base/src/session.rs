@@ -50,6 +50,22 @@ pub use jcode_session_types::{
     EnvSnapshot, GitState, SessionImproveMode, SessionStatus, StoredCompactionState,
     StoredDisplayRole, StoredMemoryInjection, StoredMessage, StoredTokenUsage,
 };
+
+pub const SESSION_CONTEXT_REMINDER_MARKER: &str = "<!-- jcode:session_context -->";
+
+/// Identify only the generated session-context reminder, not a user prompt
+/// that happens to mention the marker literally.
+pub fn is_session_context_message(message: &StoredMessage) -> bool {
+    message.role == Role::User
+        && message.display_role == Some(StoredDisplayRole::System)
+        && message.content.iter().any(|block| {
+            matches!(
+                block,
+                ContentBlock::Text { text, .. } if text.contains(SESSION_CONTEXT_REMINDER_MARKER)
+            )
+        })
+}
+
 use journal::{PersistVectorMode, SessionJournalMeta, SessionPersistState};
 pub use maintenance::prune_old_session_backups;
 pub use memory_profile::SessionMemoryProfileSnapshot;

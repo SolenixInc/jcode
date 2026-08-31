@@ -2,8 +2,6 @@ use super::state_ui::RestoredReloadInput;
 use super::*;
 use crate::tui::{backend, keybind};
 
-const SESSION_CONTEXT_REMINDER_MARKER: &str = "<!-- jcode:session_context -->";
-
 impl App {
     pub(super) fn apply_restored_reload_input(&mut self, restored: RestoredReloadInput) {
         self.input = restored.input;
@@ -353,7 +351,7 @@ impl App {
         let previous_len = self.session.messages.len();
         self.session
             .messages
-            .retain(|message| !Self::is_session_context_message(message));
+            .retain(|message| !crate::session::is_session_context_message(message));
         let removed_stale_context = self.session.messages.len() != previous_len;
 
         if !crate::hooks::hook_configured("session_context") {
@@ -382,7 +380,8 @@ impl App {
                     Role::User,
                     vec![ContentBlock::Text {
                         text: format!(
-                            "<system-reminder>\n{SESSION_CONTEXT_REMINDER_MARKER}\n{context}\n</system-reminder>"
+                            "<system-reminder>\n{}\n{context}\n</system-reminder>",
+                            crate::session::SESSION_CONTEXT_REMINDER_MARKER
                         ),
                         cache_control: None,
                     }],
@@ -415,18 +414,6 @@ impl App {
         }
     }
 
-    pub(super) fn is_session_context_message(message: &StoredMessage) -> bool {
-        message.role == Role::User
-            && message.display_role == Some(crate::session::StoredDisplayRole::System)
-            && message.content.iter().any(|block| {
-                matches!(
-                    block,
-                    ContentBlock::Text { text, .. }
-                        if text.contains(SESSION_CONTEXT_REMINDER_MARKER)
-                )
-            })
-    }
-
     pub(super) fn reject_session_context_blocker(&self) -> Result<()> {
         if let Some(error) = &self.session_context_blocker {
             return Err(anyhow::anyhow!(error.clone()));
@@ -437,7 +424,21 @@ impl App {
     pub(super) fn new_minimal_with_session(
         provider: Arc<dyn Provider>,
         registry: Registry,
+        session: Session,
+    ) -> Self {
+        Self::new_minimal_with_session_and_mode(
+            provider,
+            registry,
+            session,
+            AppRuntimeMode::TestHarness,
+        )
+    }
+
+    fn new_minimal_with_session_and_mode(
+        provider: Arc<dyn Provider>,
+        registry: Registry,
         mut session: Session,
+        runtime_mode: AppRuntimeMode,
     ) -> Self {
         let skills = Arc::new(SkillRegistry::default());
         let mcp_manager = Arc::new(RwLock::new(McpManager::new()));
@@ -636,8 +637,8 @@ impl App {
             remote_server_short_name: None,
             remote_server_icon: None,
             current_message_id: None,
-            is_remote: false,
-            runtime_mode: AppRuntimeMode::TestHarness,
+            is_remote: runtime_mode == AppRuntimeMode::RemoteClient,
+            runtime_mode,
             pending_remote_rewind_notice: None,
             remote_history_wait_started: None,
             remote_history_recovery_attempts: 0,
@@ -1416,9 +1417,12 @@ impl App {
             .as_ref()
             .and_then(|session_id| Session::load_startup_stub(session_id).ok())
             .unwrap_or_else(|| Session::create(None, None));
-        let mut app = Self::new_minimal_with_session(provider, registry, session);
-        app.is_remote = true;
-        app.runtime_mode = AppRuntimeMode::RemoteClient;
+        let mut app = Self::new_minimal_with_session_and_mode(
+            provider,
+            registry,
+            session,
+            AppRuntimeMode::RemoteClient,
+        );
         app.remote_startup_phase = Some(super::RemoteStartupPhase::Connecting);
         app.remote_startup_phase_started = Some(Instant::now());
 

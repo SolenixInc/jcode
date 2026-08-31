@@ -364,7 +364,7 @@ async fn session_context_is_fresh_and_unique_on_create_attach_and_resume() {
         .session
         .messages
         .iter()
-        .filter(|message| Agent::is_session_context_message(message))
+        .filter(|message| crate::session::is_session_context_message(message))
         .collect();
     assert_eq!(created_contexts.len(), 1);
     assert!(
@@ -388,7 +388,7 @@ async fn session_context_is_fresh_and_unique_on_create_attach_and_resume() {
         .session
         .messages
         .iter()
-        .filter(|message| Agent::is_session_context_message(message))
+        .filter(|message| crate::session::is_session_context_message(message))
         .collect();
     assert_eq!(attached_contexts.len(), 1);
     assert!(
@@ -401,7 +401,7 @@ async fn session_context_is_fresh_and_unique_on_create_attach_and_resume() {
     let persisted_attach_contexts: Vec<_> = persisted_attach
         .messages
         .iter()
-        .filter(|message| Agent::is_session_context_message(message))
+        .filter(|message| crate::session::is_session_context_message(message))
         .collect();
     assert_eq!(persisted_attach_contexts.len(), 1);
     assert!(
@@ -418,7 +418,7 @@ async fn session_context_is_fresh_and_unique_on_create_attach_and_resume() {
         .session
         .messages
         .iter()
-        .filter(|message| Agent::is_session_context_message(message))
+        .filter(|message| crate::session::is_session_context_message(message))
         .collect();
     assert_eq!(resumed_contexts.len(), 1);
     assert!(
