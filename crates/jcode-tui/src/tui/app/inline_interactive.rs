@@ -164,6 +164,35 @@ fn filter_routes_by_provider_allowlist(
     }
 }
 
+fn normalize_model_picker_models(allowlist: Option<&[String]>) -> Option<Vec<String>> {
+    let allowlist = allowlist?;
+    let models: Vec<String> = allowlist
+        .iter()
+        .map(|model| model.trim())
+        .filter(|model| !model.is_empty())
+        .map(str::to_owned)
+        .collect();
+    (!models.is_empty()).then_some(models)
+}
+
+/// Apply the strict `provider.model_picker_models` allowlist.
+///
+/// Unlike the provider allowlist, a configured model list never falls back to
+/// the unfiltered catalog when it has no matches. That makes a typo visible
+/// instead of silently defeating the user's shortlist.
+fn filter_routes_by_model_allowlist(
+    routes: Vec<crate::provider::ModelRoute>,
+    allowlist: Option<&[String]>,
+) -> Vec<crate::provider::ModelRoute> {
+    let Some(allowed_models) = normalize_model_picker_models(allowlist) else {
+        return routes;
+    };
+    routes
+        .into_iter()
+        .filter(|route| allowed_models.iter().any(|model| model == &route.model))
+        .collect()
+}
+
 fn model_picker_usage_key(model_name: &str, route: &PickerOption, effort: Option<&str>) -> String {
     format!(
         "{}\u{1f}{}\u{1f}{}\u{1f}{}",
@@ -988,6 +1017,8 @@ impl App {
         current_model: &str,
         config_default_model: Option<String>,
         config_default_provider: Option<String>,
+        model_picker_providers: Option<Vec<String>>,
+        model_picker_models: Option<Vec<String>>,
         current_effort: Option<String>,
         available_efforts: &[&str],
     ) -> ModelPickerCacheSignature {
@@ -1003,6 +1034,8 @@ impl App {
             current_model: current_model.to_string(),
             config_default_model,
             config_default_provider,
+            model_picker_providers,
+            model_picker_models,
             reasoning_effort: current_effort,
             available_efforts: available_efforts
                 .iter()
@@ -1203,6 +1236,8 @@ impl App {
             &current_model,
             config_default_model.clone(),
             config_default_provider.clone(),
+            config.provider.model_picker_providers.clone(),
+            config.provider.model_picker_models.clone(),
             current_effort.clone(),
             &available_efforts,
         );
@@ -1441,6 +1476,8 @@ impl App {
             &current_model,
             config_default_model,
             config_default_provider,
+            config.provider.model_picker_providers.clone(),
+            config.provider.model_picker_models.clone(),
             current_effort,
             &available_efforts,
         );
@@ -1552,13 +1589,28 @@ impl App {
             &current_provider,
             current_api_method.as_deref(),
         );
+        let configured_model_picker_models =
+            normalize_model_picker_models(config.provider.model_picker_models.as_deref());
+        let routes =
+            filter_routes_by_model_allowlist(routes, configured_model_picker_models.as_deref());
 
         if routes.is_empty() {
             self.inline_interactive_state = None;
-            self.push_display_message(DisplayMessage::system(
-                crate::tui::app::model_context::no_models_available_message(self.is_remote),
-            ));
-            self.set_status_notice("No models available");
+            let message = if let Some(configured_models) = configured_model_picker_models.as_deref()
+            {
+                crate::tui::app::model_context::no_configured_models_available_message(
+                    configured_models,
+                    self.is_remote,
+                )
+            } else {
+                crate::tui::app::model_context::no_models_available_message(self.is_remote)
+            };
+            self.push_display_message(DisplayMessage::system(message));
+            if configured_model_picker_models.is_some() {
+                self.set_status_notice("No configured models available");
+            } else {
+                self.set_status_notice("No models available");
+            }
             return routes;
         }
 
@@ -2044,6 +2096,8 @@ impl App {
             &current_model,
             config_default_model,
             config_default_provider,
+            config.provider.model_picker_providers.clone(),
+            config.provider.model_picker_models.clone(),
             current_effort,
             &available_efforts,
         );
@@ -3810,10 +3864,11 @@ mod tests {
     use super::{
         REMOTE_MODEL_CATALOG_CACHE_MAX_AGE_SECS, REMOTE_MODEL_CATALOG_CACHE_VERSION,
         REMOTE_MODEL_CATALOG_MAX_DETAIL_BYTES, RemoteModelCatalogCache,
-        filter_routes_by_provider_allowlist, key_char_eq_ignore_ascii_case,
-        model_picker_effort_matches_default, model_picker_route_is_current,
-        model_picker_route_is_default, model_picker_route_is_recommended,
-        next_model_favorite_after_current, picker_is_runtime_model_picker,
+        filter_routes_by_model_allowlist, filter_routes_by_provider_allowlist,
+        key_char_eq_ignore_ascii_case, model_picker_effort_matches_default,
+        model_picker_route_is_current, model_picker_route_is_default,
+        model_picker_route_is_recommended, next_model_favorite_after_current,
+        normalize_model_picker_models, picker_is_runtime_model_picker,
         remote_model_catalog_cache_is_fresh, remote_model_catalog_cache_origin,
         remote_model_catalog_snapshot_is_safe, route_supports_reasoning_effort,
     };
@@ -4449,6 +4504,52 @@ mod tests {
         );
         let models: Vec<&str> = filtered.iter().map(|r| r.model.as_str()).collect();
         assert_eq!(models, ["claude-fable-5", "deepseek/deepseek-v4-pro"]);
+    }
+
+    #[test]
+    fn model_allowlist_filters_exact_ids_and_never_falls_back() {
+        let routes = vec![
+            model_route("gpt-5.5", "OpenAI", "openai-oauth"),
+            model_route("gpt-5.5", "OpenAI", "openai-api-key"),
+            model_route("claude-fable-5", "Anthropic", "claude-oauth"),
+        ];
+
+        let filtered =
+            filter_routes_by_model_allowlist(routes.clone(), Some(&["  gpt-5.5  ".to_string()]));
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().all(|route| route.model == "gpt-5.5"));
+
+        let case_mismatch =
+            filter_routes_by_model_allowlist(routes.clone(), Some(&["GPT-5.5".to_string()]));
+        assert!(case_mismatch.is_empty());
+
+        let no_match =
+            filter_routes_by_model_allowlist(routes.clone(), Some(&["gpt-5.6".to_string()]));
+        assert!(no_match.is_empty());
+
+        assert_eq!(
+            filter_routes_by_model_allowlist(routes.clone(), None).len(),
+            3
+        );
+        assert_eq!(filter_routes_by_model_allowlist(routes, Some(&[])).len(), 3);
+    }
+
+    #[test]
+    fn model_allowlist_normalizes_entries_and_ignores_blank_only_lists() {
+        assert_eq!(
+            normalize_model_picker_models(Some(&[
+                "  gpt-5.5  ".to_string(),
+                " ".to_string(),
+                "claude-fable-5".to_string(),
+            ])),
+            Some(vec!["gpt-5.5".to_string(), "claude-fable-5".to_string()])
+        );
+        assert_eq!(normalize_model_picker_models(None), None);
+        assert_eq!(normalize_model_picker_models(Some(&[])), None);
+        assert_eq!(
+            normalize_model_picker_models(Some(&[" \t".to_string()])),
+            None
+        );
     }
 
     #[test]

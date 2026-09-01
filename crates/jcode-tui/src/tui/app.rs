@@ -291,6 +291,8 @@ struct ModelPickerCacheSignature {
     current_model: String,
     config_default_model: Option<String>,
     config_default_provider: Option<String>,
+    model_picker_providers: Option<Vec<String>>,
+    model_picker_models: Option<Vec<String>>,
     reasoning_effort: Option<String>,
     available_efforts: Vec<String>,
     simplified_model_picker: bool,

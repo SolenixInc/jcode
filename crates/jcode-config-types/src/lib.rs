@@ -1249,6 +1249,11 @@ pub struct ProviderConfig {
     /// "openai-compatible:myprofile", ...), or openai-compatible profile ids
     /// ("myprofile"). The active model's routes always stay visible.
     pub model_picker_providers: Option<Vec<String>>,
+    /// When set (non-empty), /model only lists routes whose base model is in
+    /// this exact, case-sensitive list. Entries are trimmed before matching.
+    /// Unset or empty preserves the full model catalog. This composes with
+    /// `model_picker_providers`.
+    pub model_picker_models: Option<Vec<String>>,
     /// Max seconds to wait for streaming data before timing out a request with
     /// no data received. Base budget only: high reasoning efforts scale it up
     /// automatically (see `jcode_base::provider::stream_idle_timeout_for_effort`).
@@ -1278,6 +1283,7 @@ impl Default for ProviderConfig {
             same_provider_account_failover: true,
             copilot_premium: None,
             model_picker_providers: None,
+            model_picker_models: None,
             stream_idle_timeout_secs: 180,
             max_retries: 8,
             retry_backoff_cap_secs: 30,

@@ -1891,6 +1891,33 @@ pub(super) fn no_models_available_message(is_remote: bool) -> String {
     lines.join("\n")
 }
 
+pub(super) fn no_configured_models_available_message(
+    configured_models: &[String],
+    is_remote: bool,
+) -> String {
+    let mut lines = vec![
+        "None of the configured models are available right now.".to_string(),
+        format!(
+            "Configured shortlist: {}",
+            format_model_name_list(configured_models, 8)
+        ),
+        String::new(),
+        "Next steps:".to_string(),
+        "  - Update or remove provider.model_picker_models in your jcode config".to_string(),
+        "  - Run /login to connect or refresh a provider".to_string(),
+        "  - Run /account to inspect or switch credentials".to_string(),
+    ];
+
+    if is_remote {
+        lines.push(
+            "  - If this is a remote session, reconnect if the server model list looks stale"
+                .to_string(),
+        );
+    }
+
+    lines.join("\n")
+}
+
 pub(super) fn model_switch_failure_message(error: &str, is_remote: bool) -> String {
     let mut lines = vec![
         format!("Failed to switch model: {}", error),
@@ -1942,4 +1969,23 @@ pub(super) fn unavailable_model_route_message(
     }
 
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::no_configured_models_available_message;
+
+    #[test]
+    fn configured_model_empty_state_explains_the_shortlist_and_remote_recovery() {
+        let configured_models = vec!["gpt-5.6-sol".to_string(), "claude-opus-4-8".to_string()];
+
+        let local = no_configured_models_available_message(&configured_models, false);
+        assert!(local.contains("None of the configured models are available right now."));
+        assert!(local.contains("Configured shortlist: gpt-5.6-sol, claude-opus-4-8"));
+        assert!(local.contains("provider.model_picker_models"));
+        assert!(!local.contains("remote session"));
+
+        let remote = no_configured_models_available_message(&configured_models, true);
+        assert!(remote.contains("remote session"));
+    }
 }

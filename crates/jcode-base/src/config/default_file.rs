@@ -389,6 +389,9 @@ cross_provider_failover = "countdown"
 # openai-compatible profile ids ("myprofile"). The active model's routes always
 # stay visible. Unset or empty = show everything.
 # model_picker_providers = ["myprofile", "openrouter"]
+# Only list these exact model ids in the /model picker. This composes with
+# model_picker_providers. Unset or empty = show every available model.
+# model_picker_models = ["gpt-5.6-sol", "claude-opus-4-8"]
 # Max seconds to wait for streaming data before timing out a request with no
 # data received. Raise this for slow reasoning models (e.g. DeepSeek) that think
 # silently for minutes before emitting tokens. Default: 180.
@@ -734,6 +737,19 @@ mod tests {
             config.display.reasoning_display(),
             ReasoningDisplayMode::Full,
             "the shipped user config must keep the full reasoning trace visible"
+        );
+    }
+
+    #[test]
+    fn default_config_template_documents_model_picker_models() {
+        let template = Config::default_config_file_contents();
+        assert!(
+            template.contains("# model_picker_models = ["),
+            "the template should show how to configure a model shortlist"
+        );
+        assert!(
+            template.contains("Only list these exact model ids"),
+            "the template should explain that model shortlist entries are exact"
         );
     }
 
