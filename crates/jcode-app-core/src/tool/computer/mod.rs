@@ -172,6 +172,7 @@ fn is_mutating(action: &str) -> bool {
             | "run_jxa"
             | "notify"
             | "set_brightness"
+            | "setup"
     )
 }
 

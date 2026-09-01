@@ -1,8 +1,15 @@
-//! Permission setup: check, request, deep-link, and poll the macOS TCC grants
-//! needed for desktop control.
+//! Permission setup: read-only checks, native requests, deep-linking, and
+//! polling for the macOS TCC grants needed for desktop control.
 
-use super::osa;
+use accessibility_sys::{
+    AXIsProcessTrusted, AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt,
+};
 use anyhow::Result;
+use core_foundation::base::TCFType;
+use core_foundation::boolean::CFBoolean;
+use core_foundation::dictionary::CFDictionary;
+use core_foundation::string::CFString;
+use core_graphics::access::ScreenCaptureAccess;
 use jcode_tool_types::ToolOutput;
 use serde_json::json;
 use std::process::Command;
@@ -10,42 +17,50 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 fn accessibility_ok() -> bool {
-    // System Events reports whether assistive access is enabled for us.
-    osa::run_applescript("tell application \"System Events\" to return UI elements enabled")
-        .map(|s| s.trim() == "true")
-        .unwrap_or(false)
+    // This is a native, read-only TCC preflight. It does not prompt or act on
+    // any application.
+    unsafe { AXIsProcessTrusted() }
+}
+
+fn accessibility_request() -> bool {
+    let prompt_key = unsafe { CFString::wrap_under_get_rule(kAXTrustedCheckOptionPrompt) };
+    let options = CFDictionary::from_CFType_pairs(&[(prompt_key, CFBoolean::true_value())]);
+    unsafe { AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef()) }
 }
 
 fn screen_recording_ok() -> bool {
-    let tmp = std::env::temp_dir().join(format!("jcode_setup_{}.png", std::process::id()));
-    let ok = Command::new("/usr/sbin/screencapture")
-        .arg("-x")
-        .arg(&tmp)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-        && std::fs::metadata(&tmp)
-            .map(|m| m.len() > 0)
-            .unwrap_or(false);
-    let _ = std::fs::remove_file(&tmp);
-    ok
+    // Preflight only: unlike `request`, this does not prompt and does not
+    // capture the screen.
+    ScreenCaptureAccess.preflight()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PermissionMode {
+    Check,
+    Setup,
+}
+
+/// Select the operation for a mode without performing any TCC calls.
+///
+/// Keeping the selection injectable lets tests prove that check_permissions
+/// cannot invoke the setup request path without touching live TCC state.
+pub(super) fn permissions_for_mode(
+    mode: PermissionMode,
+    preflight: impl FnOnce() -> (bool, bool),
+    request: impl FnOnce() -> (bool, bool),
+) -> (bool, bool) {
+    match mode {
+        PermissionMode::Check => preflight(),
+        PermissionMode::Setup => request(),
+    }
 }
 
 fn yes_no(b: bool) -> &'static str {
     if b { "granted" } else { "NOT granted" }
 }
 
-/// Report status only.
-pub fn check_permissions() -> Result<ToolOutput> {
-    let ax = accessibility_ok();
-    let screen = screen_recording_ok();
-    let swift = std::path::Path::new("/usr/bin/swift").exists()
-        || Command::new("/usr/bin/which")
-            .arg("swift")
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-
+/// Format a permission report without consulting TCC or touching the desktop.
+pub(super) fn format_permission_report(ax: bool, screen: bool, swift: bool) -> String {
     let mut lines = vec![
         format!("Accessibility (input + AX control): {}", yes_no(ax)),
         format!("Screen Recording (screenshots/OCR): {}", yes_no(screen)),
@@ -57,26 +72,56 @@ pub fn check_permissions() -> Result<ToolOutput> {
     if !ax || !screen {
         lines.push("Run action='setup' to request these and open the right settings pane.".into());
     }
-    Ok(ToolOutput::new(lines.join("\n")).with_metadata(json!({
-        "accessibility": ax, "screen_recording": screen, "swift": swift,
-    })))
+    lines.join("\n")
 }
 
-/// Request permissions: prompt, deep-link, and poll Accessibility until granted.
+/// Report status only. This performs native, read-only preflight checks and
+/// never prompts, captures the screen, opens or focuses an app, or creates a
+/// temporary file.
+pub fn check_permissions() -> Result<ToolOutput> {
+    let (ax, screen) = permissions_for_mode(
+        PermissionMode::Check,
+        || (accessibility_ok(), screen_recording_ok()),
+        || unreachable!("setup permission requests are not part of check_permissions"),
+    );
+    let swift = std::path::Path::new("/usr/bin/swift").exists()
+        || Command::new("/usr/bin/which")
+            .arg("swift")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+    Ok(
+        ToolOutput::new(format_permission_report(ax, screen, swift)).with_metadata(json!({
+            "accessibility": ax, "screen_recording": screen, "swift": swift,
+        })),
+    )
+}
+
+/// Request permissions, open the relevant settings panes, and poll
+/// Accessibility until granted.
 pub fn setup() -> Result<ToolOutput> {
     let mut log = Vec::new();
 
-    let ax0 = accessibility_ok();
-    let screen0 = screen_recording_ok();
+    // Native requests must happen on setup only, before any deep-linking or
+    // polling. Accessibility uses Apple's prompt option; Screen Recording's
+    // request API opens the system prompt when the grant is missing.
+    let (ax0, screen0) = permissions_for_mode(
+        PermissionMode::Setup,
+        || unreachable!("setup must use native permission requests"),
+        || {
+            let ax = accessibility_request();
+            let screen = ScreenCaptureAccess.request();
+            (ax, screen)
+        },
+    );
     log.push(format!(
         "Initial: accessibility={}, screen_recording={}",
         ax0, screen0
     ));
 
-    // Trigger the Screen Recording prompt by attempting a capture (already done
-    // in screen_recording_ok). For Accessibility, prompt + pre-add jcode by
-    // opening the pane; the trust prompt itself is shown by the host process the
-    // first time it calls an AX API.
+    // Setup is the explicitly mutating path: it may open System Settings and
+    // wait for the user to change TCC state.
     if !ax0 {
         // Deep-link to the exact Accessibility pane.
         let _ = Command::new("/usr/bin/open")

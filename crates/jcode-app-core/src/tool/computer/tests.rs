@@ -101,9 +101,74 @@ fn is_mutating_classifies() {
     assert!(super::is_mutating("click"));
     assert!(super::is_mutating("quit_app"));
     assert!(super::is_mutating("set_value"));
+    assert!(super::is_mutating("setup"));
     assert!(!super::is_mutating("screenshot"));
     assert!(!super::is_mutating("ui"));
     assert!(!super::is_mutating("discover"));
+}
+
+#[test]
+fn permission_report_formats_granted_state_without_setup_guidance() {
+    let report = super::setup::format_permission_report(true, true, true);
+    assert_eq!(
+        report,
+        "Accessibility (input + AX control): granted\n\
+Screen Recording (screenshots/OCR): granted\n\
+Swift toolchain (for OCR):          present"
+    );
+}
+
+#[test]
+fn permission_report_formats_missing_state_with_setup_guidance() {
+    let report = super::setup::format_permission_report(false, true, false);
+    assert!(report.contains("Accessibility (input + AX control): NOT granted"));
+    assert!(report.contains("Swift toolchain (for OCR):          missing"));
+    assert!(report.contains("Run action='setup'"));
+}
+
+#[test]
+fn permission_mode_selects_only_its_operation_without_live_tcc() {
+    let mut preflight_calls = 0;
+    let mut request_calls = 0;
+
+    let check = super::setup::permissions_for_mode(
+        super::setup::PermissionMode::Check,
+        || {
+            preflight_calls += 1;
+            (true, true)
+        },
+        || {
+            request_calls += 1;
+            (false, false)
+        },
+    );
+    assert_eq!(check, (true, true));
+    assert_eq!(preflight_calls, 1);
+    assert_eq!(request_calls, 0);
+
+    let setup = super::setup::permissions_for_mode(
+        super::setup::PermissionMode::Setup,
+        || {
+            preflight_calls += 1;
+            (false, false)
+        },
+        || {
+            request_calls += 1;
+            (true, true)
+        },
+    );
+    assert_eq!(setup, (true, true));
+    assert_eq!(preflight_calls, 1);
+    assert_eq!(request_calls, 1);
+}
+
+#[tokio::test]
+async fn dry_run_blocks_setup_without_prompting() {
+    let out = run_action(json!({ "action": "setup", "dry_run": true }))
+        .await
+        .unwrap();
+    assert!(out.output.contains("dry_run"));
+    assert!(out.output.contains("setup"));
 }
 
 #[test]
