@@ -75,7 +75,7 @@ system actions:
 const SETUP: &str = "\
 setup actions:
 - check_permissions {}   read-only Accessibility / Screen Recording / Swift preflight; no capture or prompts
-- setup             {}   open the right Settings panes and poll until ready (mutating; honor dry_run)
+- setup             {}   request permissions, open the right Settings panes, and poll until ready (mutating; honor dry_run)
 
 Note: the Accessibility toggle itself cannot be enabled programmatically (macOS security);
 setup gets you one click away.";

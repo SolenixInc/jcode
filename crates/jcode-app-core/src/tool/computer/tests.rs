@@ -126,6 +126,42 @@ fn permission_report_formats_missing_state_with_setup_guidance() {
     assert!(report.contains("Run action='setup'"));
 }
 
+#[test]
+fn permission_mode_selects_only_its_operation_without_live_tcc() {
+    let mut preflight_calls = 0;
+    let mut request_calls = 0;
+
+    let check = super::setup::permissions_for_mode(
+        super::setup::PermissionMode::Check,
+        || {
+            preflight_calls += 1;
+            (true, true)
+        },
+        || {
+            request_calls += 1;
+            (false, false)
+        },
+    );
+    assert_eq!(check, (true, true));
+    assert_eq!(preflight_calls, 1);
+    assert_eq!(request_calls, 0);
+
+    let setup = super::setup::permissions_for_mode(
+        super::setup::PermissionMode::Setup,
+        || {
+            preflight_calls += 1;
+            (false, false)
+        },
+        || {
+            request_calls += 1;
+            (true, true)
+        },
+    );
+    assert_eq!(setup, (true, true));
+    assert_eq!(preflight_calls, 1);
+    assert_eq!(request_calls, 1);
+}
+
 #[tokio::test]
 async fn dry_run_blocks_setup_without_prompting() {
     let out = run_action(json!({ "action": "setup", "dry_run": true }))
