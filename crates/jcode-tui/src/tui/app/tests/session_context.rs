@@ -258,6 +258,14 @@ fn local_tui_context_refresh_preserves_user_prompt_containing_marker() {
 #[test]
 fn remote_tui_constructor_leaves_session_context_hook_to_server() {
     with_temp_jcode_home(|| {
+        let mut target = crate::session::Session::create(None, None);
+        target.add_message(Role::User, vec![ContentBlock::Text {
+            text: "persisted remote conversation".to_string(),
+            cache_control: None,
+        }]);
+        target.save().expect("persist remote startup target");
+        let target_id = target.id.clone();
+
         let hook_dir = tempfile::TempDir::new().expect("hook temp dir");
         let invocations = hook_dir.path().join("invocations");
         let hook = write_session_context_test_script(
@@ -270,14 +278,16 @@ fn remote_tui_constructor_leaves_session_context_hook_to_server() {
         );
         let _hook_env = SessionContextTestEnv::new(&hook);
 
-        let app = App::new_for_remote_with_options(None, false);
+        let app = App::new_for_remote_with_options(Some(target_id.clone()), false);
 
         assert!(app.is_remote);
+        assert_eq!(app.runtime_mode, AppRuntimeMode::RemoteClient);
         assert!(
             !invocations.exists(),
             "remote client construction must not run the server-authoritative hook"
         );
-        assert!(app.session.messages.iter().all(|message| {
+        let persisted = crate::session::Session::load(&target_id).expect("load remote target");
+        assert!(persisted.messages.iter().all(|message| {
             message.content.iter().all(|block| {
                 !matches!(
                     block,
@@ -286,6 +296,13 @@ fn remote_tui_constructor_leaves_session_context_hook_to_server() {
                 )
             })
         }));
+        assert!(
+            persisted
+                .messages
+                .iter()
+                .all(|message| !crate::session::is_session_context_message(message)),
+            "remote client construction must not persist generated session context"
+        );
     });
 }
 
@@ -441,8 +458,9 @@ fn local_tui_recovery_runs_a_fresh_session_context_hook_without_duplicates() {
         let _hook_env = SessionContextTestEnv::new(&hook);
         let mut app = create_test_app();
         let original_id = app.session.id.clone();
+        let user_prompt = "conversation to recover containing <!-- jcode:session_context -->";
         app.session.add_message(Role::User, vec![ContentBlock::Text {
-            text: "conversation to recover".to_string(),
+            text: user_prompt.to_string(),
             cache_control: None,
         }]);
         app.session.save().expect("persist recovery source");
@@ -452,18 +470,17 @@ fn local_tui_recovery_runs_a_fresh_session_context_hook_without_duplicates() {
         app.recover_session_without_tools();
 
         let recovered = crate::session::Session::load(&app.session.id).expect("load recovery session");
+        assert!(recovered.messages.iter().any(|message| {
+            message.role == Role::User
+                && message.display_role.is_none()
+                && message.content.iter().any(|block| {
+                    matches!(block, ContentBlock::Text { text, .. } if text == user_prompt)
+                })
+        }), "marker-containing user prompt must survive recovery persistence");
         let hook_messages = recovered
             .messages
             .iter()
-            .filter(|message| {
-                message.content.iter().any(|block| {
-                    matches!(
-                        block,
-                        ContentBlock::Text { text, .. }
-                            if text.contains("<!-- jcode:session_context -->")
-                    )
-                })
-            })
+            .filter(|message| crate::session::is_session_context_message(message))
             .count();
         assert_ne!(app.session.id, original_id);
         assert_ne!(app.session.id, first_recovery_id);

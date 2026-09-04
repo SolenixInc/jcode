@@ -53,7 +53,6 @@ pub use jcode_agent_runtime::{
 };
 
 const JCODE_NATIVE_TOOLS: &[&str] = &["selfdev", "communicate"];
-const SESSION_CONTEXT_REMINDER_MARKER: &str = "<!-- jcode:session_context -->";
 static RECOVERED_TEXT_WRAPPED_TOOL_CALLS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static JCODE_REPO_SOURCE_STATE: LazyLock<(Option<String>, Option<bool>)> = LazyLock::new(|| {
@@ -960,7 +959,7 @@ impl Agent {
         let previous_len = self.session.messages.len();
         self.session
             .messages
-            .retain(|message| !Self::is_session_context_message(message));
+            .retain(|message| !crate::session::is_session_context_message(message));
         let removed_stale_context = self.session.messages.len() != previous_len;
         if !crate::hooks::hook_configured("session_context") {
             if removed_stale_context {
@@ -986,7 +985,8 @@ impl Agent {
                     Role::User,
                     vec![ContentBlock::Text {
                         text: format!(
-                            "<system-reminder>\n{SESSION_CONTEXT_REMINDER_MARKER}\n{context}\n</system-reminder>"
+                            "<system-reminder>\n{}\n{context}\n</system-reminder>",
+                            crate::session::SESSION_CONTEXT_REMINDER_MARKER
                         ),
                         cache_control: None,
                     }],
@@ -1017,14 +1017,6 @@ impl Agent {
                 logging::error(self.session_context_blocker.as_deref().unwrap());
             }
         }
-    }
-
-    fn is_session_context_message(message: &StoredMessage) -> bool {
-        message.role == Role::User
-            && message.display_role == Some(StoredDisplayRole::System)
-            && message.content.iter().any(|block| {
-                matches!(block, ContentBlock::Text { text, .. } if text.contains(SESSION_CONTEXT_REMINDER_MARKER))
-            })
     }
 
     pub(crate) fn reject_session_context_blocker(&self) -> anyhow::Result<()> {
